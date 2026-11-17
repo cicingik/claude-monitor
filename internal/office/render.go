@@ -251,6 +251,8 @@ func drawSofa(img *image.RGBA, r image.Rectangle, facingUp bool) {
 	pixel.Fill(img, back, cSofaDk)
 	pixel.Fill(img, seat, cSofa)
 	pixel.Fill(img, image.Rect(seat.Min.X, seat.Min.Y, seat.Max.X, seat.Min.Y+1), cSofaHi)
+	mid := (in.Min.X + in.Max.X) / 2 // seam between the two cushions
+	pixel.Fill(img, image.Rect(mid, in.Min.Y, mid+1, in.Max.Y), cSofaOut)
 	for _, x := range []int{in.Min.X, in.Max.X - 3} { // arms
 		arm := image.Rect(x, in.Min.Y, x+3, in.Max.Y)
 		pixel.Fill(img, arm, cSofa)

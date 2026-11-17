@@ -19,7 +19,7 @@ import (
 )
 
 // demoTime fixes the --demo --snapshot frame, so the picture is reproducible.
-var demoTime = time.Date(2026, 1, 1, 12, 0, 0, 800e6, time.UTC)
+var demoTime = time.Date(2026, 1, 1, 12, 0, 0, 500e6, time.UTC)
 
 func main() {
 	home, _ := os.UserHomeDir()
