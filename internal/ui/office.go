@@ -143,6 +143,7 @@ func (m *Model) refreshScene() {
 		o.focus = sc.Roster[0]
 		sc = office.LayoutFocus(m.snap, o.session, size.X, size.Y, o.now, o.focus)
 	}
+	m.cfg.Cast.Dress(&sc)
 	if sc.Page != o.page || size != o.size {
 		o.walker.Reset()
 		o.page, o.size = sc.Page, size
@@ -308,6 +309,10 @@ func (m Model) officeFooter() string {
 }
 
 func (m Model) officeHelp() string {
-	return m.help.ShortHelpView([]key.Binding{officeKeys.Prev, officeKeys.PrevSession, officeKeys.Enter,
+	h := m.help.ShortHelpView([]key.Binding{officeKeys.Prev, officeKeys.PrevSession, officeKeys.Enter,
 		key.NewBinding(key.WithKeys("v"), key.WithHelp("v", "tree")), keys.Rescan, keys.Quit})
+	if c := m.cfg.Cast; c != nil && c.Note != "" {
+		h += faint.Render("  │  " + c.Note)
+	}
+	return h
 }

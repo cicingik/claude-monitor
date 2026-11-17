@@ -56,7 +56,8 @@ type Model struct {
 
 // Config holds the optional parts of the UI.
 type Config struct {
-	Office bool // start in the office view instead of the tree
+	Office bool         // start in the office view instead of the tree
+	Cast   *office.Cast // custom character sprites; nil draws built-in ones
 }
 
 // WithConfig applies c to a new model.
