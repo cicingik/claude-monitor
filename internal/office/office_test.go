@@ -2,6 +2,7 @@ package office
 
 import (
 	"fmt"
+	"image"
 	"testing"
 	"time"
 
@@ -199,5 +200,62 @@ func BenchmarkFrame160x45(b *testing.B) {
 		now := t0.Add(time.Duration(i) * frameRate)
 		sc := LayoutFocus(snap, "sess", 160, 90, now, "a01")
 		pixel.Encode(Render(sc, now), Background)
+	}
+}
+
+func TestWalkerWalksBetweenPlaces(t *testing.T) {
+	var w Walker
+	working := office(scan.Running, []scan.Status{scan.Running})
+	sc := Layout(working, "sess", 160, 76, t0)
+	desk, _ := sc.Actor("a00")
+	w.Step(&sc, t0)
+	if a, _ := sc.Actor("a00"); a.Pos != desk.Pos || a.Anim != AnimTyping {
+		t.Fatalf("first step must place without walking: %+v", a)
+	}
+
+	// a00 goes idle: it walks to the lounge through the doorway
+	resting := office(scan.Running, []scan.Status{scan.Idle})
+	rest := Layout(resting, "sess", 160, 76, t0)
+	target, _ := rest.Actor("a00")
+	var walked []image.Point
+	for i := 1; i <= 80; i++ {
+		sc := Layout(resting, "sess", 160, 76, t0)
+		w.Step(&sc, t0.Add(time.Duration(i)*frameRate))
+		a, _ := sc.Actor("a00")
+		walked = append(walked, a.Pos)
+		if a.Pos == target.Pos {
+			if a.Anim != AnimSleep {
+				t.Errorf("arrived with anim %q, want sleep", a.Anim)
+			}
+			break
+		}
+		if a.Anim != AnimWalk {
+			t.Fatalf("step %d: anim %q while on the way", i, a.Anim)
+		}
+	}
+	if walked[len(walked)-1] != target.Pos {
+		t.Fatalf("never arrived: ended at %v, want %v", walked[len(walked)-1], target.Pos)
+	}
+	door := false
+	for _, p := range walked {
+		door = door || (p.X >= sc.Door.X-8 && p.X <= sc.Door.X+8 && p.Y == sc.Door.Y)
+	}
+	if !door {
+		t.Errorf("did not pass the doorway %v: %v", sc.Door, walked)
+	}
+
+	// a00 vanishes: it walks out with the leave animation, then is gone
+	empty := office(scan.Running, nil)
+	sc = Layout(empty, "sess", 160, 76, t0)
+	w.Step(&sc, t0.Add(81*frameRate))
+	if a, ok := sc.Actor("a00"); !ok || a.Anim != AnimLeave || a.Zone != Exit {
+		t.Fatalf("vanished actor should walk out: %+v %v", a, ok)
+	}
+	for i := 82; i < 300; i++ {
+		sc = Layout(empty, "sess", 160, 76, t0)
+		w.Step(&sc, t0.Add(time.Duration(i)*frameRate))
+	}
+	if _, ok := sc.Actor("a00"); ok {
+		t.Error("actor still drawn after walking out")
 	}
 }

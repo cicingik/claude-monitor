@@ -8,6 +8,7 @@ import (
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/cicingik/claude-monitor/internal/office"
 	"github.com/cicingik/claude-monitor/internal/scan"
 )
 
@@ -16,7 +17,7 @@ const pollEvery = time.Second
 var tabNames = []string{"Activity", "Interactions", "Usage"}
 
 type keyMap struct {
-	Up, Down, Toggle, Tab, Tab1, Tab2, Tab3, Rescan, Quit key.Binding
+	Up, Down, Toggle, Tab, Tab1, Tab2, Tab3, Rescan, Quit, View key.Binding
 }
 
 var keys = keyMap{
@@ -29,10 +30,11 @@ var keys = keyMap{
 	Tab3:   key.NewBinding(key.WithKeys("3")),
 	Rescan: key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "rescan")),
 	Quit:   key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
+	View:   key.NewBinding(key.WithKeys("v"), key.WithHelp("v", "office")),
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Up, k.Down, k.Toggle, k.Tab, k.Tab1, k.Rescan, k.Quit}
+	return []key.Binding{k.Up, k.Down, k.Toggle, k.Tab, k.Tab1, k.View, k.Rescan, k.Quit}
 }
 
 // Model is the Bubble Tea model. The snapshot is replaced wholesale on each scan.
@@ -48,6 +50,21 @@ type Model struct {
 	width     int
 	height    int
 	help      help.Model
+	cfg       Config
+	off       officeState
+}
+
+// Config holds the optional parts of the UI.
+type Config struct {
+	Office bool // start in the office view instead of the tree
+}
+
+// WithConfig applies c to a new model.
+func (m Model) WithConfig(c Config) Model {
+	m.cfg = c
+	m.off.on = c.Office
+	m.off.animating = c.Office
+	return m
 }
 
 // snapshotMsg carries a finished scan. chain marks scans from the poll loop,
@@ -60,10 +77,16 @@ type snapshotMsg struct {
 type tickMsg struct{}
 
 func New(s *scan.Scanner) Model {
-	return Model{scanner: s, collapsed: map[string]bool{}, help: help.New(), width: 100, height: 30}
+	return Model{scanner: s, collapsed: map[string]bool{}, help: help.New(), width: 100, height: 30,
+		off: officeState{walker: &office.Walker{}}}
 }
 
-func (m Model) Init() tea.Cmd { return m.scanCmd(false, true) }
+func (m Model) Init() tea.Cmd {
+	if m.off.animating {
+		return tea.Batch(m.scanCmd(false, true), frameTick())
+	}
+	return m.scanCmd(false, true)
+}
 
 func (m Model) scanCmd(reset, chain bool) tea.Cmd {
 	s := m.scanner
@@ -76,42 +99,67 @@ func (m Model) scanCmd(reset, chain bool) tea.Cmd {
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
 	switch msg := msg.(type) {
 	case snapshotMsg:
 		m.snap, m.scanned = msg.snap, true
 		m.syncCursor()
+		if m.off.now.IsZero() {
+			m.off.now = msg.snap.ScannedAt
+		}
 		if msg.chain {
-			return m, tea.Tick(pollEvery, func(time.Time) tea.Msg { return tickMsg{} })
+			cmd = tea.Tick(pollEvery, func(time.Time) tea.Msg { return tickMsg{} })
 		}
 	case tickMsg:
-		return m, m.scanCmd(false, true)
+		cmd = m.scanCmd(false, true)
+	case frameMsg:
+		if !m.off.on {
+			m.off.animating = false
+			return m, nil
+		}
+		m.off.now = time.Time(msg)
+		cmd = frameTick()
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.syncCursor()
 	case tea.KeyPressMsg:
-		switch {
-		case key.Matches(msg, keys.Quit):
-			return m, tea.Quit
-		case key.Matches(msg, keys.Up):
-			m.move(-1)
-		case key.Matches(msg, keys.Down):
-			m.move(1)
-		case key.Matches(msg, keys.Toggle):
-			if a := m.snap.ByID[m.selected]; a != nil && len(a.Children) > 0 {
-				m.collapsed[a.ID] = !m.collapsed[a.ID]
-				m.syncCursor()
-			}
-		case key.Matches(msg, keys.Tab):
-			m.tab = (m.tab + 1) % len(tabNames)
-		case key.Matches(msg, keys.Tab1):
-			m.tab = 0
-		case key.Matches(msg, keys.Tab2):
-			m.tab = 1
-		case key.Matches(msg, keys.Tab3):
-			m.tab = 2
-		case key.Matches(msg, keys.Rescan):
-			return m, m.scanCmd(true, false)
+		if m.off.on {
+			m, cmd = m.officeKey(msg)
+		} else {
+			m, cmd = m.classicKey(msg)
 		}
+	}
+	if m.off.on {
+		m.refreshScene()
+	}
+	return m, cmd
+}
+
+func (m Model) classicKey(msg tea.KeyPressMsg) (Model, tea.Cmd) {
+	switch {
+	case key.Matches(msg, keys.Quit):
+		return m, tea.Quit
+	case key.Matches(msg, keys.Up):
+		m.move(-1)
+	case key.Matches(msg, keys.Down):
+		m.move(1)
+	case key.Matches(msg, keys.Toggle):
+		if a := m.snap.ByID[m.selected]; a != nil && len(a.Children) > 0 {
+			m.collapsed[a.ID] = !m.collapsed[a.ID]
+			m.syncCursor()
+		}
+	case key.Matches(msg, keys.Tab):
+		m.tab = (m.tab + 1) % len(tabNames)
+	case key.Matches(msg, keys.Tab1):
+		m.tab = 0
+	case key.Matches(msg, keys.Tab2):
+		m.tab = 1
+	case key.Matches(msg, keys.Tab3):
+		m.tab = 2
+	case key.Matches(msg, keys.Rescan):
+		return m, m.scanCmd(true, false)
+	case key.Matches(msg, keys.View):
+		return m.enterOffice()
 	}
 	return m, nil
 }

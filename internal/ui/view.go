@@ -33,7 +33,11 @@ func glyph(s scan.Status) string {
 }
 
 func (m Model) View() tea.View {
-	v := tea.NewView(m.render())
+	content := m.render
+	if m.off.on {
+		content = m.officeView
+	}
+	v := tea.NewView(content())
 	v.AltScreen = true
 	v.WindowTitle = "claude-monitor"
 	return v

@@ -27,7 +27,7 @@ func main() {
 		ui.Dump(os.Stdout, s.Scan(time.Now()), *root, *since)
 		return
 	}
-	if _, err := tea.NewProgram(ui.New(s)).Run(); err != nil {
+	if _, err := tea.NewProgram(ui.New(s).WithConfig(ui.Config{Office: true})).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "claude-monitor:", err)
 		os.Exit(1)
 	}
