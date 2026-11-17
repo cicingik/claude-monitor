@@ -112,7 +112,7 @@ func (s *Scanner) session(snap *Snapshot, seen map[string]bool, projDir, projNam
 	path := filepath.Join(projDir, sid+".jsonl")
 	st := s.load(seen, path, info)
 	root := build(st, sid, path, info.ModTime(), now, false)
-	root.Kind, root.SessionID, root.Title = Session, sid, st.title
+	root.Kind, root.SessionID, root.Title = Session, sid, Truncate(st.title, 60)
 	root.Project = projectName(st.cwd, projName)
 
 	members := map[string]*member{sid: {a: root, st: st}}
@@ -138,7 +138,7 @@ func (s *Scanner) session(snap *Snapshot, seen map[string]bool, projDir, projNam
 		sst := s.load(seen, p, info)
 		a := build(sst, id, p, info.ModTime(), now, m.Finished != nil && *m.Finished)
 		a.Kind, a.SessionID, a.Project = Subagent, sid, root.Project
-		a.Title, a.AgentType = m.Description, m.AgentType
+		a.Title, a.AgentType = Truncate(m.Description, 60), m.AgentType
 		members[id] = &member{a: a, st: sst, m: m}
 		order = append(order, id)
 	}
