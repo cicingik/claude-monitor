@@ -2,6 +2,7 @@ package scan
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,39 +12,65 @@ import (
 	"time"
 )
 
-// line holds the fields of one transcript line that the monitor uses.
-// Everything else in the line is ignored.
+// line holds the fields of one transcript line that the monitor uses. It is
+// decoded in one pass; everything else in the line is skipped by the decoder.
 type line struct {
-	Type      string          `json:"type"`
-	Timestamp time.Time       `json:"timestamp"`
-	Cwd       string          `json:"cwd"`
-	AITitle   string          `json:"aiTitle"`
-	Message   json.RawMessage `json:"message"`
-}
-
-type assistantMessage struct {
-	ID    string `json:"id"`
-	Model string `json:"model"`
-	Usage *struct {
-		Input      int64 `json:"input_tokens"`
-		Output     int64 `json:"output_tokens"`
-		CacheRead  int64 `json:"cache_read_input_tokens"`
-		CacheWrite int64 `json:"cache_creation_input_tokens"`
-	} `json:"usage"`
-	Content []contentItem `json:"content"`
-}
-
-type userMessage struct {
-	Content json.RawMessage `json:"content"` // string or []contentItem
+	Type      string    `json:"type"`
+	Timestamp time.Time `json:"timestamp"`
+	Cwd       string    `json:"cwd"`
+	AITitle   string    `json:"aiTitle"`
+	Message   struct {
+		ID    string `json:"id"`
+		Model string `json:"model"`
+		Usage *struct {
+			Input      int64 `json:"input_tokens"`
+			Output     int64 `json:"output_tokens"`
+			CacheRead  int64 `json:"cache_read_input_tokens"`
+			CacheWrite int64 `json:"cache_creation_input_tokens"`
+		} `json:"usage"`
+		// A list of blocks, or a plain string in user prompts. A string fails
+		// to decode here and is recovered by stringContent.
+		Content []contentItem `json:"content"`
+	} `json:"message"`
 }
 
 type contentItem struct {
-	Type      string          `json:"type"`
-	Name      string          `json:"name"`
-	ID        string          `json:"id"`
-	Text      string          `json:"text"`
-	Input     json.RawMessage `json:"input"`
-	ToolUseID string          `json:"tool_use_id"`
+	Type      string    `json:"type"`
+	Name      string    `json:"name"`
+	ID        string    `json:"id"`
+	Text      string    `json:"text"`
+	Input     toolInput `json:"input"`
+	ToolUseID string    `json:"tool_use_id"`
+}
+
+// toolInput is the union of tool_use input fields the monitor reads. Large
+// fields such as a Write body or an Agent prompt are not listed, so they are
+// skipped rather than allocated.
+type toolInput struct {
+	Command      string          `json:"command"`
+	FilePath     string          `json:"file_path"`
+	Path         string          `json:"path"`
+	Pattern      string          `json:"pattern"`
+	Query        string          `json:"query"`
+	URL          string          `json:"url"`
+	Skill        string          `json:"skill"`
+	Description  string          `json:"description"`
+	SubagentType string          `json:"subagent_type"`
+	Name         string          `json:"name"`
+	To           string          `json:"to"`
+	Summary      string          `json:"summary"`
+	Message      json.RawMessage `json:"message"` // string or object
+}
+
+// stringContent recovers message.content when it is a plain string.
+func stringContent(b []byte) (string, bool) {
+	var l struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	}
+	err := json.Unmarshal(b, &l)
+	return l.Message.Content, err == nil && l.Message.Content != ""
 }
 
 // spawn is an Agent/Task tool_use seen in a transcript.
@@ -114,10 +141,48 @@ func (f *fileState) readFrom(path string) error {
 	}
 }
 
+var (
+	typeKey       = []byte(`"type"`)
+	relevantTypes = [][]byte{[]byte(`"assistant"`), []byte(`"user"`), []byte(`"ai-title"`)}
+)
+
+// mayBeRelevant is a byte-level filter run before any JSON decoding: it is
+// false only when no "type" key in b has an assistant, user or ai-title value,
+// so such lines (about 40% of transcript bytes) are never decoded.
+func mayBeRelevant(b []byte) bool {
+	for {
+		i := bytes.Index(b, typeKey)
+		if i < 0 {
+			return false
+		}
+		b = bytes.TrimLeft(b[i+len(typeKey):], " \t")
+		if len(b) == 0 || b[0] != ':' {
+			continue
+		}
+		v := bytes.TrimLeft(b[1:], " \t")
+		for _, t := range relevantTypes {
+			if bytes.HasPrefix(v, t) {
+				return true
+			}
+		}
+	}
+}
+
 func (f *fileState) parseLine(b []byte) {
+	if !mayBeRelevant(b) {
+		return
+	}
 	var l line
+	var texts []string
 	if err := json.Unmarshal(b, &l); err != nil {
-		return // malformed line: skip
+		var te *json.UnmarshalTypeError
+		if !errors.As(err, &te) {
+			return // malformed line: skip
+		}
+		// A field had an unexpected type; the rest was still decoded.
+		if s, ok := stringContent(b); ok && l.Message.Content == nil {
+			texts = append(texts, s)
+		}
 	}
 	if f.cwd == "" && l.Cwd != "" {
 		f.cwd = l.Cwd
@@ -128,7 +193,7 @@ func (f *fileState) parseLine(b []byte) {
 		f.parseAssistant(l)
 	case "user":
 		f.touch(l.Timestamp)
-		f.parseUser(l)
+		f.parseUser(l, texts)
 	case "ai-title":
 		if l.AITitle != "" {
 			f.title = l.AITitle
@@ -149,10 +214,7 @@ func (f *fileState) touch(t time.Time) {
 }
 
 func (f *fileState) parseAssistant(l line) {
-	var m assistantMessage
-	if err := json.Unmarshal(l.Message, &m); err != nil {
-		return
-	}
+	m := l.Message
 	if m.Model != "" && !strings.HasPrefix(m.Model, "<") { // skip "<synthetic>"
 		f.model = m.Model
 	}
@@ -184,15 +246,7 @@ func (f *fileState) parseAssistant(l line) {
 }
 
 func (f *fileState) recordInteraction(at time.Time, c contentItem) {
-	var in struct {
-		Description  string `json:"description"`
-		SubagentType string `json:"subagent_type"`
-		Name         string `json:"name"`
-		To           string `json:"to"`
-		Summary      string `json:"summary"`
-		Message      any    `json:"message"`
-	}
-	_ = json.Unmarshal(c.Input, &in)
+	in := c.Input
 	switch c.Name {
 	case "Agent", "Task":
 		f.spawns[c.ID] = spawn{At: at, Description: in.Description, SubagentType: in.SubagentType, Name: in.Name}
@@ -201,8 +255,8 @@ func (f *fileState) recordInteraction(at time.Time, c contentItem) {
 			return
 		}
 		label := in.Summary
-		if s, ok := in.Message.(string); ok && label == "" {
-			label = s
+		if label == "" {
+			_ = json.Unmarshal(in.Message, &label) // only when message is a string
 		}
 		f.sends = append(f.sends, sent{At: at, To: in.To, Label: oneLine(label, 40)})
 	}
@@ -210,29 +264,15 @@ func (f *fileState) recordInteraction(at time.Time, c contentItem) {
 
 var agentMessageRe = regexp.MustCompile(`<agent-message from="([A-Za-z0-9_-]+)"`)
 
-func (f *fileState) parseUser(l line) {
-	var m userMessage
-	if err := json.Unmarshal(l.Message, &m); err != nil || len(m.Content) == 0 {
-		return
-	}
-	var texts []string
-	var s string
-	if json.Unmarshal(m.Content, &s) == nil {
-		texts = append(texts, s)
-	} else {
-		var items []contentItem
-		if json.Unmarshal(m.Content, &items) != nil {
-			return
-		}
-		for _, it := range items {
-			switch it.Type {
-			case "tool_result":
-				if it.ToolUseID != "" {
-					f.resolved[it.ToolUseID] = true
-				}
-			case "text":
-				texts = append(texts, it.Text)
+func (f *fileState) parseUser(l line, texts []string) {
+	for _, it := range l.Message.Content {
+		switch it.Type {
+		case "tool_result":
+			if it.ToolUseID != "" {
+				f.resolved[it.ToolUseID] = true
 			}
+		case "text":
+			texts = append(texts, it.Text)
 		}
 	}
 	for _, t := range texts {
@@ -258,32 +298,24 @@ func (f *fileState) addEvent(e Event) {
 }
 
 // toolSummary renders "Tool: short arg" from a tool_use input.
-func toolSummary(name string, raw json.RawMessage) string {
-	var in map[string]any
-	_ = json.Unmarshal(raw, &in)
-	str := func(k string) string { s, _ := in[k].(string); return s }
+func toolSummary(name string, in toolInput) string {
 	var arg string
 	switch name {
 	case "Bash":
-		arg = str("command")
+		arg = in.Command
 	case "Read", "Write", "Edit", "NotebookEdit":
-		arg = shortPath(str("file_path"))
+		arg = shortPath(in.FilePath)
 	case "Agent", "Task":
-		arg = str("description")
-		if t := str("subagent_type"); t != "" {
-			arg += " (" + t + ")"
+		arg = in.Description
+		if in.SubagentType != "" {
+			arg += " (" + in.SubagentType + ")"
 		}
 	case "SendMessage":
-		arg = "to " + str("to")
-	case "WebFetch":
-		arg = str("url")
-	case "WebSearch":
-		arg = str("query")
-	case "Skill":
-		arg = str("skill")
+		arg = "to " + in.To
 	default:
-		for _, k := range []string{"description", "file_path", "path", "pattern", "query", "skill", "name", "url"} {
-			if arg = str(k); arg != "" {
+		for _, v := range []string{in.Description, in.FilePath, in.Path, in.Pattern, in.Query, in.Skill, in.URL, in.Name} {
+			if v != "" {
+				arg = v
 				break
 			}
 		}
