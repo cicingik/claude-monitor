@@ -221,3 +221,22 @@ func keys(m map[string]*Agent) []string {
 	}
 	return out
 }
+
+func TestMayBeRelevant(t *testing.T) {
+	tests := []struct {
+		line string
+		want bool
+	}{
+		{`{"type":"assistant","message":{}}`, true},
+		{`{"message":{"role":"user"},"type" : "user"}`, true}, // key order and spacing vary
+		{`{"type":"ai-title","aiTitle":"x"}`, true},
+		{`{"type":"attachment","attachment":{"type":"text"}}`, false},
+		{`{"type":"api-request-blob","body":{"messages":[{"role":"user","content":[{"type":"tool_result"}]}]}}`, false},
+		{`{"uuid":"1"}`, false},
+	}
+	for _, tc := range tests {
+		if got := mayBeRelevant([]byte(tc.line)); got != tc.want {
+			t.Errorf("mayBeRelevant(%s) = %v, want %v", tc.line, got, tc.want)
+		}
+	}
+}
