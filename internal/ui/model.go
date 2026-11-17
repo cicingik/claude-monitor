@@ -58,6 +58,7 @@ type Model struct {
 type Config struct {
 	Office bool         // start in the office view instead of the tree
 	Cast   *office.Cast // custom character sprites; nil draws built-in ones
+	Demo   bool         // show office.Demo data instead of scanning
 }
 
 // WithConfig applies c to a new model.
@@ -90,8 +91,11 @@ func (m Model) Init() tea.Cmd {
 }
 
 func (m Model) scanCmd(reset, chain bool) tea.Cmd {
-	s := m.scanner
+	s, demo := m.scanner, m.cfg.Demo
 	return func() tea.Msg {
+		if demo {
+			return snapshotMsg{snap: office.Demo(time.Now()), chain: chain}
+		}
 		if reset {
 			s.Reset()
 		}

@@ -120,9 +120,10 @@ func cycle(ids []string, cur string, d int) string {
 	return ids[0]
 }
 
-func (m Model) canvasSize() image.Point {
-	return image.Pt(m.width, 2*(m.height-chromeRows))
-}
+func (m Model) canvasSize() image.Point { return CanvasSize(m.width, m.height) }
+
+// CanvasSize is the office canvas, in pixels, of a cols×rows terminal.
+func CanvasSize(cols, rows int) image.Point { return image.Pt(cols, 2*(rows-chromeRows)) }
 
 // refreshScene lays out the shown session for the current frame. The session
 // falls back to the most recently active one, the focus to its lead.
