@@ -230,6 +230,9 @@ func build(st *fileState, id, path string, mtime, now time.Time, finished bool) 
 	}
 	for mid, u := range st.usage {
 		a.Usage = a.Usage.Add(u)
+		if u == (Usage{}) {
+			continue // e.g. <synthetic> messages: no tokens, no model bucket
+		}
 		m := st.msgModel[mid]
 		if m == "" {
 			m = "unknown"

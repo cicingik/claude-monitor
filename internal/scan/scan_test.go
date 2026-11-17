@@ -66,7 +66,7 @@ func TestAgents(t *testing.T) {
 			name: "unknown toolUseId falls back to the session",
 			id:   "a3", parent: "sess-1", title: "Orphan task", typ: "Plan",
 			model: "claude-opus-5-5", kind: Subagent,
-			turns: 1, usage: Usage{Input: 1, Output: 1},
+			turns: 2, usage: Usage{Input: 1, Output: 1}, // second turn is a zero-usage <synthetic> message
 		},
 	}
 	for _, tc := range tests {
@@ -94,6 +94,9 @@ func TestAgents(t *testing.T) {
 	}
 	if got := snap.ByModel["claude-opus-5-5"].Output; got != 90+8+1 {
 		t.Errorf("ByModel opus output=%d want 99", got)
+	}
+	if len(snap.ByModel) != 2 {
+		t.Errorf("ByModel has %d models, want 2 (no bucket for zero-usage messages): %v", len(snap.ByModel), snap.ByModel)
 	}
 	if got := snap.ByModel["claude-sonnet-4-5-20250929"].Output; got != 14 {
 		t.Errorf("ByModel sonnet output=%d want 14", got)
