@@ -1,116 +1,268 @@
 # claude-monitor
 
-A terminal UI that watches Claude Code agents. It shows what each session and
+A terminal app that watches Claude Code agents. It shows what each session and
 subagent is doing, how they interact (spawn, message, handback), and how many
 tokens each one used.
 
-By default it draws each session as a pixel-art office: every agent is a small
-animated character at a desk or in the lounge. Press `v` for the classic tree
-and tabs.
+It draws one pixel-art office (`assets/office.png`) for every session at once, sent to
+the terminal as images (iTerm2, kitty or sixel; half blocks otherwise). Agents
+are animated characters at desks, in the lounge, or walking through. Click one
+to see what it did. Press `v` for the tree and tabs.
 
-![The office view, rendered from the built-in demo data](docs/office.png)
+It is read-only. It reads transcript files under `~/.claude/projects` and every
+`~/.claude-*/projects` (so the sessions of several accounts show together), and
+never calls Claude or any network service.
 
-It is read-only. It reads transcript files under `~/.claude/projects` and never
-calls Claude or any network service.
+The app is the Rust crate at the repo root; its pictures are in `assets/`.
 
 ## Install
 
-Requires Go 1.26 or newer.
+There are three ways in: a release archive, a build from source, or a
+cross-build of archives for other systems with `build.sh`.
+
+### From a release archive
+
+A release archive is one of the files `build.sh` writes to `dist/`. Each holds
+one folder with the binary, `assets/` (`office.png` and `character.gif`) and this README.
+Pick the archive for your system:
+
+| System               | Archive                                              |
+|----------------------|------------------------------------------------------|
+| Linux x86_64         | `office-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64          | `office-<version>-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS Intel          | `office-<version>-x86_64-apple-darwin.tar.gz`   |
+| macOS Apple silicon  | `office-<version>-aarch64-apple-darwin.tar.gz`  |
+| Windows x86_64       | `office-<version>-x86_64-pc-windows-gnu.zip`    |
+| Windows ARM64        | `office-<version>-aarch64-pc-windows-gnullvm.zip` |
+
+#### Linux and macOS
+
+1. Download the archive and `SHA256SUMS` into one folder.
+2. Check the archive against `SHA256SUMS`:
+
+   ```sh
+   sha256sum -c --ignore-missing SHA256SUMS                         # Linux
+   grep aarch64-apple-darwin SHA256SUMS | shasum -a 256 -c          # macOS
+   ```
+
+3. Extract it and enter the folder:
+
+   ```sh
+   tar -xzf office-0.1.0-aarch64-apple-darwin.tar.gz
+   cd office-0.1.0-aarch64-apple-darwin
+   ```
+
+4. macOS only: the binary is not signed. A browser download marks it as
+   quarantined, and macOS then refuses to open it. Remove the mark:
+
+   ```sh
+   xattr -d com.apple.quarantine office
+   ```
+
+   `No such xattr` means there was no mark. That is fine.
+5. Run it from the folder, so it finds `assets/office.png` and `assets/character.gif`:
+
+   ```sh
+   ./office
+   ```
+
+6. Optional: to run it from any directory, keep the folder in one place and put
+   a wrapper on your `PATH` that passes the picture and the character:
+
+   ```sh
+   mkdir -p ~/.local/share ~/.local/bin
+   mv ../office-0.1.0-aarch64-apple-darwin ~/.local/share/office
+   cat > ~/.local/bin/office <<'EOF'
+   #!/bin/sh
+   d="$HOME/.local/share/office"
+   exec "$d/office" "$d/assets/office.png" --character "$d/assets/character.gif" "$@"
+   EOF
+   chmod +x ~/.local/bin/office
+   ```
+
+   `~/.local/bin` must be on your `PATH`.
+
+#### Windows
+
+1. Download the `.zip` and `SHA256SUMS`.
+2. Check the archive in PowerShell. The hash must match its line in
+   `SHA256SUMS`:
+
+   ```powershell
+   (Get-FileHash .\office-0.1.0-x86_64-pc-windows-gnu.zip).Hash.ToLower()
+   ```
+
+3. Extract it (right-click, Extract All) or in PowerShell:
+
+   ```powershell
+   Expand-Archive .\office-0.1.0-x86_64-pc-windows-gnu.zip -DestinationPath .
+   cd .\office-0.1.0-x86_64-pc-windows-gnu
+   ```
+
+4. The binary is not signed. Unblock it, or SmartScreen asks first (More info,
+   Run anyway):
+
+   ```powershell
+   Unblock-File .\office.exe
+   ```
+
+5. Open WezTerm or Windows Terminal, go to the folder and run:
+
+   ```powershell
+   .\office.exe
+   ```
+
+   The old console window (`conhost`) shows no images. Use WezTerm or Windows
+   Terminal.
+
+On Windows it reads `%USERPROFILE%\.claude\projects` and every
+`%USERPROFILE%\.claude-*\projects`. Sessions that run inside WSL keep their
+transcripts in the WSL home. Pass that with
+`--root \\wsl$\<distro>\home\<you>\.claude\projects`.
+
+#### Terminals that show images
+
+| Terminal                                  | Drawn with |
+|-------------------------------------------|------------|
+| WezTerm (Linux, macOS, Windows)           | iTerm2 images |
+| iTerm2 (macOS)                            | iTerm2 images |
+| kitty (Linux, macOS)                      | kitty images |
+| Windows Terminal 1.22 or newer            | sixel |
+| foot, and other terminals with sixel      | sixel |
+| Terminal.app, the Windows console, others | half blocks (coarse, but works) |
+
+`--protocol auto` (the default) asks the terminal. Force one with
+`--protocol iterm2`, `kitty`, `sixel` or `halfblocks`.
+
+### From source
+
+1. Install Rust 1.85 or newer with rustup:
+   - Linux and macOS:
+     `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`.
+     macOS also needs the command line tools: `xcode-select --install`.
+   - Windows: run `rustup-init.exe` from <https://rustup.rs>. It installs the
+     Visual Studio C++ build tools it needs.
+2. Get the code and build:
+
+   ```sh
+   git clone <this repository> claude-monitor
+   cd claude-monitor
+   cargo build --release
+   ```
+
+3. Run it from the repo root, where `assets/` is:
+
+   ```sh
+   ./target/release/office
+   ```
+
+   On Windows the binary is `target\release\office.exe`.
+
+### Cross-build archives with build.sh
+
+`./build.sh` builds the release archives for every system above.
+It runs on Linux or macOS with bash. Targets build with `cargo zigbuild`, which
+uses zig as the linker. A macOS host builds its own target with plain `cargo`.
+Linux binaries link against glibc 2.17, so they run on old distros too.
+
+1. Install what it needs, once:
+
+   ```sh
+   ./build.sh --setup
+   ```
+
+   This adds the rustup targets, installs `cargo-zigbuild`, and installs zig
+   into `~/.local/opt` (linked from `~/.local/bin/zig`) when no zig is found.
+   Without `--setup`, the script prints the install command for anything
+   missing and stops.
+2. Build every target, or name the ones you want:
+
+   ```sh
+   ./build.sh
+   ./build.sh x86_64-pc-windows-gnu aarch64-apple-darwin
+   ```
+
+3. Check the result:
+
+   ```sh
+   cd dist && sha256sum -c SHA256SUMS
+   ```
+
+The archives and `SHA256SUMS` land in `dist/` at the repo root. Windows archives
+are `.zip` when `zip` is installed, else `.tar.gz`. A target that fails does
+not stop the others; the script lists it at the end and exits non-zero. The
+macOS binaries are not signed.
+
+## Run
 
 ```sh
-go install github.com/cicingik/claude-monitor@latest
+./target/release/office            # from the repo root
+./target/release/office --dump     # scan once, print the tree as text
+./target/release/office --snapshot room.png   # render the room to a PNG, exit
 ```
 
-Or build from a checkout:
+`assets/office.png` (the room) and `assets/character.gif` (the default character)
+are read relative to the working directory. Run from the repo root (or the extracted archive
+folder), or pass the picture as the argument and `--character FILE`.
+
+On Windows WezTerm from WSL, start it in a WezTerm window of its own:
 
 ```sh
-go build -o bin/claude-monitor .
+./window.sh [office flags...]
 ```
 
-## Usage
+The script builds the binary if needed. A window of its own keeps images out of
+the `wezterm-mux-server`, which drops the whole domain when images are replaced
+many times a second.
 
-```sh
-claude-monitor                 # interactive TUI, sessions active in the last 24h
-claude-monitor --since 2h      # only sessions whose transcript changed in the last 2h
-claude-monitor --since 0       # every session on disk
-claude-monitor --dump          # scan once, print plain text, exit
-claude-monitor --root /path/to/projects
-claude-monitor --demo          # the office with built-in synthetic data, no transcripts read
-claude-monitor --snapshot office.png --session <id> --scale 4   # one frame to a PNG, exit
-```
+| Flag            | Default                    | Meaning |
+|-----------------|----------------------------|---------|
+| `OFFICE.png`    | `assets/office.png`        | The office picture |
+| `--root DIR`    | `~/.claude/projects` and every `~/.claude-*/projects` | Projects directory; repeat for more |
+| `--since DUR`   | `24h`                      | Only sessions whose transcript changed within DUR (`0` = all) |
+| `--sprites DIR` | `$XDG_CONFIG_HOME/claude-monitor/sprites` (else `~/.config/claude-monitor/sprites`) | Custom character GIF/PNG files, see [Custom characters](#custom-characters) |
+| `--character F` | `assets/character.gif`     | Character for agents with no sprite; `""` for a built-in figure |
+| `--dump`        | off                        | Scan once, print the tree, edges and usage as text, exit |
+| `--snapshot OUT.png` | off                   | Scan once, render the room once a visitor has walked in (at most 30 s on), exit |
+| `--protocol P`  | `auto`                     | `auto`, `iterm2`, `kitty`, `sixel` or `halfblocks`; `auto` asks the terminal, else half blocks |
+| `--font WxH`    | asked from the terminal    | Cell size in pixels when the terminal does not answer; with `--protocol`, nothing is asked (default `10x20`) |
 
-| Flag         | Default                              | Meaning                                                        |
-|--------------|--------------------------------------|----------------------------------------------------------------|
-| `--root`     | `~/.claude/projects`                 | Claude Code projects directory                                 |
-| `--since`    | `24h`                                | Skip sessions whose transcript file is older than this (0 = all) |
-| `--dump`     | off                                  | Print the tree, edges and per-model usage as text, then exit   |
-| `--sprites`  | `$XDG_CONFIG_HOME/claude-monitor/sprites` (else `~/.config/claude-monitor/sprites`) | Directory of custom character GIF/PNG files |
-| `--snapshot` | off                                  | Scan once, render one office frame to this PNG, then exit      |
-| `--session`  | most recently active                 | Session shown by `--snapshot`                                  |
-| `--scale`    | `4`                                  | Pixel scale of the `--snapshot` PNG                            |
-| `--demo`     | off                                  | Use a built-in synthetic snapshot instead of scanning; works with the TUI, `--dump` and `--snapshot` |
+`OFFICE_VIEW_TRACE=FILE` also appends every byte written to the terminal to
+FILE, for debugging the image stream.
 
-The TUI rescans every second. Each scan reads only the lines appended since the
-last one, so polling stays cheap on large transcripts.
+## One room
 
-`--snapshot` lays the office out as a 160x45 terminal would show it, at the
-time of the scan, and scales it up nearest-neighbour. `--demo --snapshot` always
-renders the same frame.
+All sessions share one office. There are no session keys.
 
-## Office view
+- **Residents:** agents of active sessions take desks and lounge seats. A
+  session is active when it has an agent that is running or active, or not done
+  and busy in the last 5 minutes. The most recently active lead gets the
+  manager's desk; other leads and subagents take the desk grid. Running and
+  active agents sit at desks, idle ones in the lounge, done ones are dimmed with
+  a `✓` and walk out after 10 minutes. Residents beyond the free places walk
+  around as visitors instead of overlapping.
+- **Visitors:** agents of inactive sessions walk in from the entrance now and
+  then, a few at a time, wander a short route, and walk out again.
+- **Links:** a spawn, message or handback younger than 90 seconds is drawn as a
+  still dotted line between the two agents, with a letter travelling along it.
+  Visitors have no links.
 
-The default view. One office per session; the header shows which session
-(`◀ 2/7 ▶`) and starts on the most recently active one.
+The office shows no text except the card.
 
-- **Work room** (wood floor): the session's main agent sits at the lead desk
-  (darker wood, a plant and a gold plaque); each subagent owns a desk with a
-  CRT, keyboard and green chair. A token meter above each desk is that agent's
-  tokens relative to the busiest agent in the session.
-- **Lounge** (blue floor): sofas around a coffee table, and a checker kitchen
-  strip with a coffee counter.
-- **Back wall**: shelves, a clock and the exit door.
+## Keys
 
-| Status    | Where and how                                                    |
-|-----------|------------------------------------------------------------------|
-| running   | at its desk, typing; the screen flickers green; a speech bubble  |
-| active    | at its desk, idle bob; the screen is on                          |
-| idle      | walks to the lounge and dozes on a sofa (`z`)                    |
-| done      | in the lounge, dimmed, with a `✓` above its head                 |
-| done > 10 min | walks out the exit door; counted in the footer as "left"     |
+| Key                              | Action |
+|----------------------------------|--------|
+| click an agent (visitors too)    | select it and open its card: name, what it did, whom it dealt with |
+| click elsewhere, `esc`           | close the card |
+| `i`                              | open or close the card of the selected agent |
+| `↑`/`↓`, `k`/`j`, `tab`, wheel   | select the previous or next agent |
+| `enter`                          | open the selected agent in the tree view |
+| `v`                              | switch between the office and the tree view |
+| `r`                              | rescan |
+| `q`, `esc`, `ctrl+c`             | quit (`esc` closes an open card first) |
 
-New agents walk in from the exit door. Agents that change place walk there,
-through the doorway between the rooms.
-
-Edges younger than 90 seconds are drawn as a moving dotted line with a letter
-travelling from sender to receiver: yellow for spawn, cyan for message, green
-for handback. Older edges are only listed in the strip.
-
-Under the canvas:
-
-- **Strip** (4 lines): the selected agent's description, type, model, status
-  and current tool (`now:`); its tokens (in, out, cache read and write), turns
-  and last activity; its edges, newest first, with live ones in their link
-  color; and `busy`, the text of every speech bubble (the running tool).
-- **Footer**: the session's total tokens and its totals per model, and how many
-  agents left.
-
-When a session has more agents than desks or lounge seats, the office pages:
-the header shows `page 1/2` and selecting an agent shows its page. Sprites
-never overlap. Below 80x24 a one-line message replaces the canvas.
-
-Pixels are drawn with the upper-half block `▀`, two pixels per cell, in 24-bit
-color; terminals without truecolor get the nearest 256 colors.
-
-### Office keys
-
-| Key                          | Action                                   |
-|------------------------------|------------------------------------------|
-| `↑`/`↓`, `k`/`j`, `tab`      | select the previous or next agent        |
-| `[` `]`, `←` `→`             | previous or next session                 |
-| `enter`                      | open the selected agent in the tree view |
-| `v`                          | switch to the tree view                  |
-| `r`                          | drop all state and rescan                |
-| `q`, `ctrl+c`                | quit                                     |
+In the tree view, `enter`/`space` collapse and `tab`, `1` `2` `3` switch tabs.
 
 ## Custom characters
 
@@ -122,23 +274,21 @@ agent picks, in order:
    `my-agent.gif`, and `session.gif` for the main agent;
 2. otherwise one of the files not named after an agent type in use, chosen by a
    stable hash of the agent id;
-3. otherwise a built-in character.
+3. otherwise the `--character` file (default `assets/character.gif`), or a built-in
+   figure.
 
-Animated GIFs keep their frame delays, disposal and transparency. Transparent
-margins are cropped and the image is scaled nearest-neighbour to the character
-height (16 pixels, at most 12 wide). A missing directory or a broken file never
-stops the monitor; the help bar shows a one-line note instead.
+Animated GIFs keep their frame delays. A missing directory or a broken file
+never stops the monitor.
 
 These files stay on your machine. Keep them in the sprites directory, not in
 this repository: `sprites/` is in `.gitignore`.
 
 ## Art and licensing
 
-All built-in art (floors, walls, furniture and characters) is original, drawn
-in Go code as pixel maps in `internal/office/art.go` and `render.go`. No image
-files are bundled. `docs/office.png` is rendered from the built-in demo data.
-Custom sprites are loaded only from your local directory at run time and are
-never copied anywhere; only use art you have the right to use.
+The room is `assets/office.png` and the default character is
+`assets/character.gif`, both read at run time relative to the working directory. Custom sprites are loaded only
+from your local directory at run time and are never copied anywhere; only use
+art you have the right to use.
 
 ## Tree view
 
@@ -180,8 +330,8 @@ Status glyphs:
 
 ## Data sources
 
-All paths are under `--root` (default `~/.claude/projects`). Nothing else under
-`~/.claude` is read.
+All paths are under `--root` (default `~/.claude/projects` and every
+`~/.claude-*/projects`). Nothing else under `~/.claude*` is read.
 
 - `<project>/<sessionId>.jsonl`: the main session, one JSON object per line.
   The project directory is the session cwd with `/` replaced by `-`; the UI
@@ -217,17 +367,7 @@ monitor never prints full message text.
 ## Development
 
 ```sh
-go vet ./... && go test ./... -count=1
-go test ./internal/pixel ./internal/office -bench . -run '^$'   # frame time
+cargo build --release && cargo test && cargo clippy -- -D warnings
 ```
 
-Scanner tests run on synthetic transcripts in `internal/scan/testdata`.
-`BenchmarkFrame160x45` times one full office frame (layout, render and
-encode) for a 160x45 terminal.
-
-Regenerate the screenshot from demo data only, with no custom sprites:
-
-```sh
-go build -o bin/claude-monitor . && mkdir -p /tmp/no-sprites &&
-  ./bin/claude-monitor --demo --sprites /tmp/no-sprites --snapshot docs/office.png --scale 4
-```
+Some tests read `assets/office.png`.
