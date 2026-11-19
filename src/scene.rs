@@ -2,7 +2,7 @@
 //! scaled to it, and the drawing of characters, marks and dotted links at the
 //! resolution the office is shown.
 
-use std::{collections::VecDeque, error::Error, f64::consts::PI, fs::File, io::BufReader, path::Path, time::Duration};
+use std::{collections::VecDeque, error::Error, f64::consts::PI, io::Cursor, path::Path, time::Duration};
 
 use image::{
     AnimationDecoder, RgbaImage,
@@ -115,9 +115,14 @@ impl Sprite {
     /// of one opaque color around the figure (as some GIFs have) is made
     /// transparent.
     pub fn load(path: &Path) -> Result<Sprite, Box<dyn Error>> {
+        Sprite::decode(&std::fs::read(path)?)
+    }
+
+    /// Like `load`, from the file's bytes; a GIF is told by its signature.
+    pub fn decode(bytes: &[u8]) -> Result<Sprite, Box<dyn Error>> {
         let mut frames = Vec::new();
-        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gif")) {
-            for f in GifDecoder::new(BufReader::new(File::open(path)?))?.into_frames() {
+        if bytes.starts_with(b"GIF8") {
+            for f in GifDecoder::new(Cursor::new(bytes))?.into_frames() {
                 let f = f?;
                 let (n, d) = f.delay().numer_denom_ms();
                 // GIF delays of 0 and 1 (×10 ms) mean "as fast as possible": use the default.
@@ -126,7 +131,7 @@ impl Sprite {
                 frames.push((f.into_buffer(), delay));
             }
         } else {
-            frames.push((image::open(path)?.to_rgba8(), DEFAULT_DELAY));
+            frames.push((image::load_from_memory(bytes)?.to_rgba8(), DEFAULT_DELAY));
         }
         Sprite::from_frames(frames)
     }

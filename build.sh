@@ -13,8 +13,8 @@
 #
 # Output, in <repo>/dist:
 #   office-<version>-<target>.tar.gz  (.zip for Windows when zip exists)
-#     each holds office-<version>-<target>/ with the binary, assets/office.png,
-#     assets/character.gif, assets/pet.gif and README.md
+#     each holds office-<version>-<target>/ with the binary (the pictures in
+#     assets/ are built into it) and README.md
 #   SHA256SUMS  (check with: cd dist && sha256sum -c SHA256SUMS)
 set -euo pipefail
 
@@ -94,9 +94,7 @@ if [ ${#missing[@]} -gt 0 ]; then
   fi
 fi
 
-for f in assets/office.png assets/character.gif assets/pet.gif README.md; do
-  [ -f "$repo/$f" ] || { echo "missing $repo/$f: every archive ships it" >&2; exit 1; }
-done
+[ -f "$repo/README.md" ] || { echo "missing $repo/README.md: every archive ships it" >&2; exit 1; }
 
 if command -v sha256sum >/dev/null; then sha256() { sha256sum "$@"; }; else sha256() { shasum -a 256 "$@"; }; fi
 
@@ -122,9 +120,7 @@ for t in "${targets[@]}"; do
   name="office-$version-$t"
   stage=$(mktemp -d)
   mkdir "$stage/$name"
-  mkdir "$stage/$name/assets"
   cp "$dir/target/$t/release/$exe" "$repo/README.md" "$stage/$name/"
-  cp "$repo/assets/office.png" "$repo/assets/character.gif" "$repo/assets/pet.gif" "$stage/$name/assets/"
   rm -f "$dist/$name.tar.gz" "$dist/$name.zip"
   if [[ $t == *windows* ]] && command -v zip >/dev/null; then
     (cd "$stage" && zip -qr "$dist/$name.zip" "$name")

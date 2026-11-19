@@ -16,7 +16,8 @@ only network call is the one that shows each account's plan limits in the
 tree's Usage tab (see [Accounts](#accounts)), made once that tab is shown;
 `--offline` turns it off. It never calls Claude.
 
-The app is the Rust crate at the repo root; its pictures are in `assets/`.
+The app is the Rust crate at the repo root. Its pictures in `assets/` are built
+into the binary, so it runs from any directory with no arguments.
 
 ## Install
 
@@ -26,7 +27,7 @@ cross-build of archives for other systems with `build.sh`.
 ### From a release archive
 
 A release archive is one of the files `build.sh` writes to `dist/`. Each holds
-one folder with the binary, `assets/` (`office.png`, `character.gif` and `pet.gif`) and this README.
+one folder with the binary and this README.
 Pick the archive for your system:
 
 | System               | Archive                                              |
@@ -63,25 +64,16 @@ Pick the archive for your system:
    ```
 
    `No such xattr` means there was no mark. That is fine.
-5. Run it from the folder, so it finds `assets/office.png`, `assets/character.gif`
-   and `assets/pet.gif`:
+5. Run it:
 
    ```sh
    ./office
    ```
 
-6. Optional: to run it from any directory, keep the folder in one place and put
-   a wrapper on your `PATH` that passes the picture, the character and the pet:
+6. Optional: to run it from any directory, put the binary on your `PATH`:
 
    ```sh
-   mkdir -p ~/.local/share ~/.local/bin
-   mv ../office-0.1.0-aarch64-apple-darwin ~/.local/share/office
-   cat > ~/.local/bin/office <<'EOF'
-   #!/bin/sh
-   d="$HOME/.local/share/office"
-   exec "$d/office" "$d/assets/office.png" --character "$d/assets/character.gif" --pet "$d/assets/pet.gif" "$@"
-   EOF
-   chmod +x ~/.local/bin/office
+   mkdir -p ~/.local/bin && mv office ~/.local/bin/
    ```
 
    `~/.local/bin` must be on your `PATH`.
@@ -138,9 +130,8 @@ transcripts in the WSL home. Pass that with
 `--protocol auto` (the default) asks the terminal. Force one with
 `--protocol iterm2`, `kitty`, `sixel` or `halfblocks`.
 
-When the terminal reports that office's tab or window lost focus (WezTerm,
-kitty, iTerm2 and most others do), office stops drawing until focus comes back.
-It keeps scanning, so it catches up at once.
+office keeps drawing whether or not its window has focus, so it stays live
+beside the window you are working in.
 
 ### From source
 
@@ -158,7 +149,7 @@ It keeps scanning, so it catches up at once.
    cargo build --release
    ```
 
-3. Run it from the repo root, where `assets/` is:
+3. Run it, from any directory:
 
    ```sh
    ./target/release/office
@@ -204,15 +195,13 @@ macOS binaries are not signed.
 ## Run
 
 ```sh
-./target/release/office            # from the repo root
+./target/release/office            # from any directory, no arguments needed
 ./target/release/office --dump     # scan once, print the tree as text
 ./target/release/office --snapshot room.png   # render the room to a PNG, exit
 ```
 
 `assets/office.png` (the room), `assets/character.gif` (the default character)
-and `assets/pet.gif` (the pet) are read relative to the working directory. Run
-from the repo root (or the extracted archive folder), or pass the picture as the
-argument, `--character FILE` and `--pet FILE`.
+and `assets/pet.gif` (the pet) are built into the binary at compile time.
 
 On Windows WezTerm from WSL, start it in a WezTerm window of its own:
 
@@ -226,12 +215,9 @@ many times a second.
 
 | Flag            | Default                    | Meaning |
 |-----------------|----------------------------|---------|
-| `OFFICE.png`    | `assets/office.png`        | The office picture |
 | `--root DIR`    | `~/.claude/projects` and every `~/.claude-*/projects` | Projects directory; repeat for more |
 | `--since DUR`   | `24h`                      | Only sessions whose transcript changed within DUR (`0` = all) |
 | `--sprites DIR` | `$XDG_CONFIG_HOME/claude-monitor/sprites` (else `~/.config/claude-monitor/sprites`) | Custom character GIF/PNG files, see [Custom characters](#custom-characters) |
-| `--character F` | `assets/character.gif`     | Character for agents with no sprite; `""` for a built-in figure |
-| `--pet F`       | `assets/pet.gif`           | GIF or PNG of the pet that strolls round the lobby; `""` for no pet. A missing or broken file means no pet and a note at exit, never a failure |
 | `--dump`        | off                        | Scan once, print the tree, edges and usage as text, exit |
 | `--snapshot OUT.png` | off                   | Scan once, render the room once a visitor has walked in (at most 30 s on), exit |
 | `--offline`     | off                        | Never fetch the accounts' limits; the Usage tab's Accounts say `offline` |
@@ -265,14 +251,13 @@ All sessions share one office. There are no session keys.
   then, a few at a time, wander a short route through any room with a door
   (lounges, kitchen, washroom, meeting room, manager's office, lobby and open
   plan), and walk out again.
-- **Pet:** a pet (`assets/pet.gif`, or `--pet FILE`) strolls round the lobby
+- **Pet:** a pet (`assets/pet.gif`) strolls round the lobby
   for good: along the aisles round the reception desk and to the lounge's and
   meeting room's doors, pausing 1 to 4 seconds at each stop, at half a
   visitor's pace. It never leaves the lobby, never goes to the entrance, and
   steps on when an agent stops where it waits. It is not an agent: it cannot be
   clicked or selected and has no links. It is sized so its usual frame is
   about 0.6 of a character's height (a jump in the GIF can reach higher).
-  `--pet ""` leaves it out.
 - **Links:** a spawn, message or handback younger than 90 seconds is drawn as a
   still dotted line between the two agents, with a letter travelling along it.
   Visitors have no links.
@@ -304,8 +289,7 @@ agent picks, in order:
    `my-agent.gif`, and `session.gif` for the main agent;
 2. otherwise one of the files not named after an agent type in use, chosen by a
    stable hash of the agent id;
-3. otherwise the `--character` file (default `assets/character.gif`), or a built-in
-   figure.
+3. otherwise the default character, `assets/character.gif`.
 
 Animated GIFs keep their frame delays. A missing directory or a broken file
 never stops the monitor.
@@ -316,8 +300,8 @@ this repository: `sprites/` is in `.gitignore`.
 ## Art and licensing
 
 The room is `assets/office.png`, the default character is
-`assets/character.gif` and the pet is `assets/pet.gif`, all read at run time
-relative to the working directory. Custom sprites are loaded only
+`assets/character.gif` and the pet is `assets/pet.gif`, all built into the
+binary. Custom sprites are loaded only
 from your local directory at run time and are never copied anywhere; only use
 art you have the right to use.
 

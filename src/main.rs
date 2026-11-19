@@ -41,10 +41,6 @@
 //! again, at most once every WHOLE_EVERY.
 //! Other protocols draw the picture as a ratatui image, with the card on it.
 //!
-//! When the terminal reports that office lost focus (its tab or window is
-//! left), office paints the whole picture once more and then draws nothing
-//! until focus comes back, while it goes on scanning.
-//!
 //! Keys, office: click an agent (a visitor too) to select it and open its
 //! card; i opens or closes the card; ↑/↓, k/j, tab, the mouse wheel select
 //! an agent, residents then visitors (the card follows); enter opens the
@@ -90,7 +86,7 @@ use ratatui::{
     buffer::{Buffer, CellDiffOption},
     crossterm::{
         cursor::Show,
-        event::{self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEventKind},
+        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEventKind},
         execute,
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode},
     },
@@ -115,17 +111,19 @@ const TICK: Duration = Duration::from_millis(100);
 /// Cell size in pixels assumed when the terminal does not report one.
 const DEFAULT_FONT: (u16, u16) = (10, 20);
 
-const USAGE: &str = "usage: office [flags] [OFFICE.png]
+/// The room, the character for agents the sprites give none, and the pet,
+/// built into the binary so it runs from any directory.
+const OFFICE_PNG: &[u8] = include_bytes!("../assets/office.png");
+const CHARACTER_GIF: &[u8] = include_bytes!("../assets/character.gif");
+const PET_GIF: &[u8] = include_bytes!("../assets/pet.gif");
 
-  OFFICE.png   the office picture (default assets/office.png)
+const USAGE: &str = "usage: office [flags]
+
   --root DIR   a Claude Code projects directory; repeat for more (default
                ~/.claude/projects and every ~/.claude-*/projects)
   --since DUR  only sessions whose transcript changed within DUR (default 24h, 0 = all)
   --sprites DIR  character .gif/.png files named after agent types, or any name
                (default $XDG_CONFIG_HOME/claude-monitor/sprites, else ~/.config/claude-monitor/sprites)
-  --character  GIF or PNG for agents the sprites give none (default assets/character.gif,
-               \"\" for a built-in figure)
-  --pet FILE   GIF or PNG of the pet that strolls round the lobby (default assets/pet.gif, \"\" for none)
   --dump       scan once, print the tree, edges and usage as text, exit
   --snapshot OUT.png  scan once, render the office at full size to OUT.png as it stands
                once a visitor has walked in (at most 30 s on), exit
@@ -148,14 +146,11 @@ env: OFFICE_VIEW_TRACE=FILE  also append every byte written to the terminal to F
       (not the queries that detect the protocol and cell size)";
 
 struct Args {
-    office: PathBuf,
-    character: Option<PathBuf>,
     protocol: Option<ProtocolType>, // None: auto
     font: Option<(u16, u16)>,
     roots: Vec<PathBuf>,      // empty: ~/.claude/projects and every ~/.claude-*/projects
     since: i64,               // nanoseconds, 0 = all
     sprites: Option<PathBuf>, // None: the default directory
-    pet: Option<PathBuf>,     // None: no pet
     dump: bool,
     snapshot: Option<PathBuf>,
     offline: bool, // no requests for the accounts' limits
@@ -163,19 +158,15 @@ struct Args {
 
 fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut args = Args {
-        office: "assets/office.png".into(),
-        character: Some("assets/character.gif".into()),
         protocol: None,
         font: None,
         roots: Vec::new(),
         since: 24 * 3600 * scan::SEC,
         sprites: None,
-        pet: Some("assets/pet.gif".into()),
         dump: false,
         snapshot: None,
         offline: false,
     };
-    let mut office = None;
     while let Some(a) = it.next() {
         let (name, inline) = match a.split_once('=') {
             Some((n, v)) if n.starts_with("--") => (n.to_string(), Some(v.to_string())),
@@ -184,7 +175,6 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         let mut value = || inline.clone().or_else(|| it.next()).ok_or(format!("{name} needs a value"));
         match name.as_str() {
             "-h" | "--help" => return Err(USAGE.into()),
-            "--character" => args.character = Some(value()?).filter(|p| !p.is_empty()).map(PathBuf::from),
             "--protocol" => {
                 args.protocol = match value()?.as_str() {
                     "auto" => None,
@@ -203,17 +193,12 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--root" => args.roots.push(value()?.into()),
             "--since" => args.since = format::parse_duration(&value()?)?,
             "--sprites" => args.sprites = Some(value()?.into()),
-            "--pet" => args.pet = Some(value()?).filter(|p| !p.is_empty()).map(PathBuf::from),
             "--dump" => args.dump = true,
             "--snapshot" => args.snapshot = Some(value()?.into()),
             "--offline" => args.offline = true,
             _ if name.starts_with('-') && name != "-" => return Err(format!("unknown flag {name}\n\n{USAGE}")),
-            _ if office.is_none() => office = Some(a),
             _ => return Err(format!("unexpected argument {a:?}\n\n{USAGE}")),
         }
-    }
-    if let Some(o) = office {
-        args.office = o.into();
     }
     Ok(args)
 }
@@ -381,16 +366,12 @@ fn show(out: &mut Counted, office: &RgbaImage, cast: &mut Cast, d: &Display, app
     // picture was last painted, and whether the next frame paints it again
     // to make the many one.
     let (mut pieces, mut whole, mut collapse) = (Pieces::default(), Instant::now(), false);
-    // False after the terminal reports its focus went elsewhere (another
-    // tab or window): no frames until it comes back, past one that leaves
-    // the office in one image.
-    let mut focused = true;
     loop {
         while let Ok(s) = scans.try_recv() {
             app.set_snapshot(s);
         }
         let now = Instant::now();
-        if full || (now >= next && (focused || collapse)) {
+        if full || now >= next {
             let collapsing = std::mem::take(&mut collapse);
             let size = term.size()?;
             if size != pane {
@@ -471,9 +452,7 @@ fn show(out: &mut Counted, office: &RgbaImage, cast: &mut Cast, d: &Display, app
             next = now + TICK.max(now.elapsed());
             full = false;
         }
-        // Out of focus, only the scans are taken, once a second.
-        let wait = if focused || collapse { next.saturating_duration_since(Instant::now()) } else { Duration::from_secs(1) };
-        if !event::poll(wait)? {
+        if !event::poll(next.saturating_duration_since(Instant::now()))? {
             continue;
         }
         // Take every pending event before the next frame, so a drag-resize refits once.
@@ -492,17 +471,6 @@ fn show(out: &mut Counted, office: &RgbaImage, cast: &mut Cast, d: &Display, app
                 }
                 Event::Resize(..) => {
                     full = true;
-                    None
-                }
-                // Hidden or not, a tab out of focus is not looked at: its last
-                // frame leaves the office in one image, which is all the
-                // terminal has to show again when it comes back.
-                Event::FocusLost => {
-                    (focused, collapse, next) = (false, true, Instant::now());
-                    None
-                }
-                Event::FocusGained => {
-                    (focused, next) = (true, Instant::now());
                     None
                 }
                 _ => None,
@@ -859,27 +827,16 @@ fn home() -> PathBuf {
 }
 
 /// The sprites, from --sprites or $XDG_CONFIG_HOME/claude-monitor/sprites
-/// (else ~/.config/claude-monitor/sprites), with --character for the rest,
-/// and the --pet. A pet that does not load is left out, with a note.
+/// (else ~/.config/claude-monitor/sprites), with the built-in character for
+/// the rest, and the built-in pet.
 fn load_cast(args: &Args) -> Result<Cast, String> {
-    let fallback = match &args.character {
-        Some(p) => Some(Sprite::load(p).map_err(|e| format!("character {}: {e}", p.display()))?),
-        None => None,
-    };
+    let fallback = Some(Sprite::decode(CHARACTER_GIF).map_err(|e| format!("character: {e}"))?);
     let dir = args.sprites.clone().unwrap_or_else(|| {
         let base = env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()).map_or_else(|| home().join(".config"), PathBuf::from);
         base.join("claude-monitor").join("sprites")
     });
     let mut cast = Cast::load(&dir, args.sprites.is_some(), fallback);
-    if let Some(p) = &args.pet {
-        match Sprite::load(p) {
-            Ok(s) => cast.pet = Some(s),
-            Err(e) => {
-                let note = format!("pet: {}: {e}; no pet", p.display());
-                cast.note = if cast.note.is_empty() { note } else { format!("{}\n{note}", cast.note) };
-            }
-        }
-    }
+    cast.pet = Some(Sprite::decode(PET_GIF).map_err(|e| format!("pet: {e}"))?);
     Ok(cast)
 }
 
@@ -902,7 +859,7 @@ fn dump(args: &Args) -> Result<String, Box<dyn Error>> {
 /// size, laid out at the time of the scan and walked on (one TICK a step)
 /// until a visitor has been in for 2 s, or for at most 30 s.
 fn snapshot(args: &Args, out: &Path) -> Result<String, Box<dyn Error>> {
-    let office = image::open(&args.office).map_err(|e| format!("{}: {e}", args.office.display()))?.to_rgba8();
+    let office = image::load_from_memory(OFFICE_PNG)?.to_rgba8();
     let mut cast = load_cast(args)?;
     let snap = Scanner::new(roots(args), args.since).scan(now());
     if snap.roots.is_empty() {
@@ -966,7 +923,7 @@ fn scanner(roots: Vec<scan::Root>, since: i64) -> (Receiver<Snapshot>, Sender<()
 
 fn restore(out: &mut impl Write) {
     let _ = disable_raw_mode();
-    let _ = execute!(out, DisableFocusChange, DisableMouseCapture, LeaveAlternateScreen, Show);
+    let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen, Show);
 }
 
 fn run(args: Args) -> Result<String, Box<dyn Error>> {
@@ -976,7 +933,7 @@ fn run(args: Args) -> Result<String, Box<dyn Error>> {
     if let Some(out) = &args.snapshot {
         return snapshot(&args, out);
     }
-    let office = image::open(&args.office).map_err(|e| format!("{}: {e}", args.office.display()))?.to_rgba8();
+    let office = image::load_from_memory(OFFICE_PNG)?.to_rgba8();
     let mut cast = load_cast(&args)?;
     let mut app = App::new(args.since, now() as u64);
     // Only here, never for --dump or --snapshot; nothing is fetched until the Usage tab shows.
@@ -993,7 +950,7 @@ fn run(args: Args) -> Result<String, Box<dyn Error>> {
     }));
     // Clicks are reported only once detection has had its answers, so none is taken for one.
     let shown = Display::detect(&args).and_then(|d| {
-        execute!(out, EnableMouseCapture, EnableFocusChange)?;
+        execute!(out, EnableMouseCapture)?;
         Ok((show(&mut out, &office, &mut cast, &d, &mut app, &scans, &rescan)?, d))
     });
     restore(&mut out);
@@ -1444,13 +1401,11 @@ mod tests {
         assert_eq!(plan(Vec::new(), l.area, Some(cards[1]), Some(cards[1])), (Vec::new(), Vec::new()));
     }
 
-    /// The pet: drawn in the lobby by default (assets/pet.gif, from the
-    /// crate root where tests run), its own item, repainted only when its
-    /// frame or where it stands changes, never clickable, no bigger on the
-    /// screen than a typing agent. `--pet ""` and a broken file leave it
-    /// out, the latter with a note, and neither fails.
+    /// The pet: drawn in the lobby (the built-in assets/pet.gif), its own
+    /// item, repainted only when its frame or where it stands changes, never
+    /// clickable, no bigger on the screen than a typing agent.
     #[test]
-    fn a_pet_strolls_the_lobby_unless_told_not_to() {
+    fn a_pet_strolls_the_lobby() {
         let font = (10, 20);
         let l = scene::fit((1254, 1254), 140, 40, font, false);
         let flags = |extra: &[&str]| parse_args(["--sprites", "/nonexistent"].iter().chain(extra).map(|s| s.to_string())).unwrap();
@@ -1486,13 +1441,6 @@ mod tests {
             (was, pose) = (items, now);
         }
         assert!(walked > 10, "walked {walked} frames of 100");
-
-        for (extra, note) in [(&["--pet", ""][..], ""), (&["--pet", "/nonexistent/pet.gif"][..], "pet: /nonexistent/pet.gif: ")] {
-            let cast = load_cast(&flags(extra)).unwrap();
-            assert!(cast.pet.is_none() && cast.note.contains(note) && cast.note.contains("pet") != note.is_empty(), "{extra:?}: {}", cast.note);
-            let (_, items) = Stage::new(&office, l, &cast).compose((1254, 1254), &app, &cast, Duration::ZERO);
-            assert!(!items.contains_key(actors::PET), "{extra:?}");
-        }
     }
 
     /// The card goes out as text alone: cursor moves, colors and its
@@ -1535,12 +1483,12 @@ mod tests {
 
     #[test]
     fn flags_parse() {
-        let a = parse_args(["--root", "/a", "--root=/b", "--since", "2h", "--dump", "pic.png"].map(String::from).into_iter()).unwrap();
+        let a = parse_args(["--root", "/a", "--root=/b", "--since", "2h", "--dump"].map(String::from).into_iter()).unwrap();
         assert_eq!((a.roots.len(), a.since, a.dump), (2, 7200 * scan::SEC, true));
-        assert_eq!(a.office, PathBuf::from("pic.png"));
-        assert_eq!(a.pet, Some(PathBuf::from("assets/pet.gif")), "a pet by default");
-        assert_eq!(parse_args(["--pet", ""].map(String::from).into_iter()).unwrap().pet, None);
-        assert_eq!(parse_args(["--pet=cat.png"].map(String::from).into_iter()).unwrap().pet, Some(PathBuf::from("cat.png")));
+        // The pictures are built in: no picture argument, no --character or --pet.
+        for gone in [&["pic.png"][..], &["--character", "c.gif"], &["--pet", "p.gif"]] {
+            assert!(parse_args(gone.iter().map(|s| s.to_string())).is_err(), "{gone:?}");
+        }
         assert!(parse_args(["--since", "2"].map(String::from).into_iter()).is_err());
         // One room: there is no session to pick.
         assert!(parse_args(["--session", "s"].map(String::from).into_iter()).is_err_and(|e| e.starts_with("unknown flag --session")));

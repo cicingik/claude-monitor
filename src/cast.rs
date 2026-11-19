@@ -2,7 +2,7 @@
 //! per agent: the file named after the agent
 //! type (general-purpose.gif, session.png, ...), else one of the files not
 //! named after a type seen so far, by a hash of the agent id, else the
-//! fallback character (--character, or a built-in figure).
+//! fallback character (the built-in assets/character.gif).
 
 use std::{collections::HashSet, path::Path, time::Duration};
 
