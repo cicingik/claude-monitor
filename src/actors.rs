@@ -275,7 +275,7 @@ pub struct Scene {
 }
 
 fn at_desk(s: Status) -> bool {
-    matches!(s, Status::Running | Status::Active)
+    matches!(s, Status::Running | Status::Waiting | Status::Active)
 }
 
 /// Whether the session root is active at now: one of its agents is running
@@ -336,7 +336,7 @@ pub fn layout(snap: &Snapshot, now: i64, was: &Scene) -> Scene {
         let anim = match a.status {
             Status::Running => Anim::Typing,
             Status::Idle => Anim::Sleep,
-            Status::Active | Status::Done => Anim::Idle,
+            Status::Waiting | Status::Active | Status::Done => Anim::Idle,
         };
         let lead = a.kind == Kind::Session;
         let kind = if lead { "session".into() } else { a.agent_type.clone() };
@@ -656,6 +656,7 @@ pub fn link_rgb(k: EdgeKind) -> [u8; 3] {
 }
 
 const CHECK: [&str; 6] = ["......#", ".....##", "#...##.", "##.##..", ".###...", "..#...."];
+const QUESTION: [&str; 7] = [".###.", "#...#", "....#", "...#.", "..#..", ".....", "..#.."];
 const ZED: [&str; 5] = ["#####", "...#.", "..#..", ".#...", "#####"];
 const ARROW: [&str; 4] = ["#######", ".#####.", "..###..", "...#..."];
 const BUBBLE: [&str; 6] = [".#########.", "#.........#", "#.1..2..3.#", "#.........#", ".####.####.", ".....##...."];
@@ -762,7 +763,7 @@ pub fn paint(canvas: &mut RgbaImage, l: &Layout, office: (u32, u32), sc: &Scene,
             });
         };
         let (dark, white) = ([0x2a, 0x2a, 0x33], [0xff, 0xff, 0xff]);
-        let (blue, green, yellow) = ([0xa8, 0xd8, 0xff], [0x5f, 0xe0, 0x7a], [0xff, 0xd8, 0x3a]);
+        let (blue, green, yellow, orange) = ([0xa8, 0xd8, 0xff], [0x5f, 0xe0, 0x7a], [0xff, 0xd8, 0x3a], [0xff, 0x8c, 0x1a]);
         match a.anim {
             Anim::Typing => {
                 let dots = (ms / 300 % 4) as u32;
@@ -778,11 +779,13 @@ pub fn paint(canvas: &mut RgbaImage, l: &Layout, office: (u32, u32), sc: &Scene,
                 rise.hash(&mut h);
                 mark(&ZED, (ch * 0.3) as i64, -rise * u, blue, &|c| (c == '#').then_some(blue));
             }
+            // Waiting for the user, walking to its desk or there.
+            _ if a.status == Status::Waiting => mark(&QUESTION, 0, -u, orange, &|c| (c == '#').then_some(orange)),
             _ if a.status == Status::Done && a.anim != Anim::Walk && !a.visitor => mark(&CHECK, 0, -u, green, &|c| (c == '#').then_some(green)),
             _ => {}
         }
         if a.selected {
-            let y = if a.anim == Anim::Typing || a.status == Status::Done { -8 * u } else { -u };
+            let y = if a.anim == Anim::Typing || matches!(a.status, Status::Done | Status::Waiting) { -8 * u } else { -u };
             mark(&ARROW, 0, y, yellow, &|c| (c == '#').then_some(yellow));
         }
         items.insert(a.id.clone(), Item { key: h.finish(), rects });

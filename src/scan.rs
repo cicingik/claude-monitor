@@ -19,6 +19,11 @@ pub const SEC: i64 = 1_000_000_000;
 pub const MAX_EVENTS: usize = 50;
 const RUNNING_WINDOW: i64 = 120 * SEC;
 const ACTIVE_WINDOW: i64 = 30 * SEC;
+/// A tool call that may need the user is taken as waiting once nothing has
+/// been written for WAIT_QUIET (a call that needs no one answers sooner),
+/// and for at most WAIT_WINDOW (past that the session was likely closed).
+const WAIT_QUIET: i64 = 3 * SEC;
+const WAIT_WINDOW: i64 = 3600 * SEC;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -32,6 +37,7 @@ pub enum Status {
     Idle,    // nothing written for 30s or more
     Active,  // transcript written less than 30s ago
     Running, // last tool_use has no tool_result yet and file written less than 2m ago
+    Waiting, // last tool_use waits for the user: a question, a plan, or a permission prompt
     Done,    // subagent meta says finished
 }
 
@@ -39,6 +45,7 @@ impl Status {
     pub fn glyph(self) -> &'static str {
         match self {
             Status::Running => "●",
+            Status::Waiting => "?",
             Status::Active => "◐",
             Status::Done => "✓",
             Status::Idle => "○",
@@ -48,6 +55,7 @@ impl Status {
     pub fn name(self) -> &'static str {
         match self {
             Status::Running => "running",
+            Status::Waiting => "waiting",
             Status::Active => "active",
             Status::Done => "done",
             Status::Idle => "idle",
@@ -249,7 +257,9 @@ struct FileState {
     msg_model: HashMap<String, String>, // message.id -> model
     events: Vec<Event>,
     last_tool_id: String,
+    last_tool_name: String,
     last_tool: String,
+    mode: String, // the last permission-mode entry: "default", "plan", "acceptEdits", "auto", ...
     resolved: HashSet<String>,     // tool_use ids that have a tool_result
     spawns: HashMap<String, Spawn>, // tool_use id -> Agent/Task call
     sends: Vec<Sent>,
@@ -407,7 +417,8 @@ impl Scanner {
             .iter()
             .enumerate()
             .map(|(i, m)| {
-                let mut a = build(st(m), key(&m.id), m.mtime, now, m.meta.finished);
+                // Subagents' files hold no mode: they run in their session's.
+                let mut a = build(st(m), key(&m.id), m.mtime, now, m.meta.finished, &root_st.mode);
                 a.session_id = key(sid);
                 a.config = root.label.clone();
                 a.project = project.clone();
@@ -489,7 +500,25 @@ fn read_meta(path: &Path) -> Meta {
 }
 
 /// Turns parse state into an agent with status, usage and events.
-fn build(st: &FileState, id: String, mtime: i64, now: i64, finished: bool) -> Agent {
+/// Whether a call of tool stops for the user in permission mode: a question
+/// or a plan always does; in a mode that asks, every tool that changes
+/// something or reaches out (in acceptEdits, all but file edits). Rules the
+/// user allowed in settings are not known here, so those count as asking.
+fn asks_user(mode: &str, tool: &str) -> bool {
+    const NEVER_ASK: [&str; 9] = ["Read", "Glob", "Grep", "LS", "TodoWrite", "ToolSearch", "Agent", "Task", "SendMessage"];
+    const EDITS: [&str; 4] = ["Edit", "MultiEdit", "Write", "NotebookEdit"];
+    match tool {
+        "AskUserQuestion" | "ExitPlanMode" => true,
+        _ if NEVER_ASK.contains(&tool) => false,
+        _ => match mode {
+            "default" | "plan" => true,
+            "acceptEdits" => !EDITS.contains(&tool),
+            _ => false, // auto, bypassPermissions, dontAsk, or not recorded
+        },
+    }
+}
+
+fn build(st: &FileState, id: String, mtime: i64, now: i64, finished: bool, mode: &str) -> Agent {
     let mut a = Agent {
         id,
         parent_id: String::new(),
@@ -521,6 +550,8 @@ fn build(st: &FileState, id: String, mtime: i64, now: i64, finished: bool) -> Ag
     let age = now - mtime;
     a.status = if finished {
         Status::Done
+    } else if st.pending() && (WAIT_QUIET..WAIT_WINDOW).contains(&age) && asks_user(mode, &st.last_tool_name) {
+        Status::Waiting
     } else if st.pending() && age < RUNNING_WINDOW {
         Status::Running
     } else if age < ACTIVE_WINDOW {
@@ -598,6 +629,7 @@ impl FileState {
                 self.touch(at);
                 self.parse_user(&v, at);
             }
+            "permission-mode" => self.mode = s(&v, "permissionMode").to_string(),
             "ai-title" => {
                 let t = s(&v, "aiTitle");
                 if !t.is_empty() {
@@ -649,6 +681,7 @@ impl FileState {
                     let (name, input) = (s(c, "name"), c.get("input").unwrap_or(&Value::Null));
                     let sum = tool_summary(name, input, 50);
                     self.last_tool_id = s(c, "id").to_string();
+                    self.last_tool_name = name.to_string();
                     self.last_tool = tool_summary(name, input, NOW_MAX);
                     self.add_event(Event { at, kind: "tool_use", tool: name.into(), summary: sum });
                     self.record_interaction(at, name, s(c, "id"), input);
@@ -731,7 +764,7 @@ impl FileState {
 /// "type" key in b has an assistant, user or ai-title value.
 fn may_be_relevant(mut b: &[u8]) -> bool {
     const KEY: &[u8] = b"\"type\"";
-    const TYPES: [&[u8]; 3] = [b"\"assistant\"", b"\"user\"", b"\"ai-title\""];
+    const TYPES: [&[u8]; 4] = [b"\"assistant\"", b"\"user\"", b"\"ai-title\"", b"\"permission-mode\""];
     let trim = |b: &[u8]| -> usize { b.iter().take_while(|&&c| c == b' ' || c == b'\t').count() };
     loop {
         let Some(i) = b.windows(KEY.len()).position(|w| w == KEY) else { return false };
@@ -958,6 +991,52 @@ mod tests {
         let snap = s.scan(now);
         assert_eq!(snap.roots, ["s1", "s1@work"]);
         assert_eq!(snap.by_id["s1@work"].config, "work");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A tool call that needs the user, unanswered and quiet for a few
+    /// seconds, is Waiting: always for a question or a plan, else by the
+    /// session's permission mode, which subagents share.
+    #[test]
+    fn waiting_follows_the_tool_and_the_sessions_mode() {
+        let pending = |tool: &str| FileState { last_tool_id: "t".into(), last_tool_name: tool.into(), ..FileState::default() };
+        let at = |st: &FileState, mode: &str, age: i64| build(st, "x".into(), 0, age, false, mode).status;
+        for (tool, mode, want) in [
+            ("Bash", "default", Status::Waiting),
+            ("Bash", "plan", Status::Waiting),
+            ("Bash", "auto", Status::Running),
+            ("Bash", "bypassPermissions", Status::Running),
+            ("Bash", "", Status::Running),
+            ("Edit", "acceptEdits", Status::Running),
+            ("Bash", "acceptEdits", Status::Waiting),
+            ("Read", "default", Status::Running),
+            ("Agent", "plan", Status::Running),
+            ("AskUserQuestion", "auto", Status::Waiting),
+            ("ExitPlanMode", "bypassPermissions", Status::Waiting),
+        ] {
+            assert_eq!(at(&pending(tool), mode, 5 * SEC), want, "{tool} in {mode:?}");
+        }
+        assert_eq!(at(&pending("Bash"), "default", SEC), Status::Running, "not quiet long enough yet");
+        assert_eq!(at(&pending("Bash"), "default", 2 * WAIT_WINDOW), Status::Idle, "long gone");
+        let mut answered = pending("AskUserQuestion");
+        answered.resolved.insert("t".into());
+        assert_eq!(at(&answered, "default", 5 * SEC), Status::Active);
+
+        let dir = std::env::temp_dir().join(format!("office-wait-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let proj = dir.join("projects").join("-home-me-proj");
+        write(&proj.join("s1.jsonl"), &[
+            r#"{"type":"permission-mode","permissionMode":"auto","sessionId":"s1"}"#,
+            r#"{"type":"permission-mode","permissionMode":"default","sessionId":"s1"}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T10:00:00Z","message":{"id":"m1","content":[{"type":"tool_use","id":"tu1","name":"Agent","input":{"description":"d"}}]}}"#,
+        ]);
+        write(&proj.join("s1").join("subagents").join("agent-a1.jsonl"), &[
+            r#"{"type":"assistant","timestamp":"2026-01-01T10:00:01Z","message":{"id":"x1","content":[{"type":"tool_use","id":"tu2","name":"Bash","input":{"command":"rm -rf build"}}]}}"#,
+        ]);
+        let now = mtime(&fs::metadata(proj.join("s1").join("subagents").join("agent-a1.jsonl")).unwrap()) + 5 * SEC;
+        let snap = Scanner::new(vec![Root::new(dir.join("projects"))], 0).scan(now);
+        assert_eq!(snap.by_id["a1"].status, Status::Waiting, "the subagent runs in its session's last mode");
+        assert_eq!(snap.by_id["s1"].status, Status::Running, "spawning asks no one");
         let _ = fs::remove_dir_all(&dir);
     }
 }

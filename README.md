@@ -250,7 +250,10 @@ All sessions share one office. There are no session keys.
   and busy in the last 5 minutes. The most recently active lead gets the
   manager's desk; other leads and subagents take the desk grid, then the meeting
   room. Running and active agents work, idle ones rest and doze (`z`), done ones
-  rest dimmed with a `✓` and walk out after 10 minutes. Residents beyond the
+  rest dimmed with a `✓` and walk out after 10 minutes. An agent waiting for
+  you (a question, a plan to approve, or a permission prompt) stays at its desk
+  with an orange `?` above its head, and its card says what it waits on.
+  Residents beyond the
   free places walk around as visitors instead of overlapping.
 - **Visitors:** agents of inactive sessions walk in from the entrance now and
   then, a few at a time, wander a short route through any room with a door
@@ -359,10 +362,16 @@ Status glyphs:
 
 | Glyph | Status  | Rule                                                              |
 |-------|---------|-------------------------------------------------------------------|
+| `?`   | waiting | last tool_use has no tool_result, nothing written for 3s (up to 1h), and it stops for you: always for `AskUserQuestion` and `ExitPlanMode`; in `default` (manual) and `plan` mode for any tool but reads, searches and spawns; in `acceptEdits` for any of those but file edits; never in `auto` or `bypassPermissions`. Subagents use their session's mode. |
 | `●`   | running | last tool_use has no tool_result yet and the file was written < 2m ago |
 | `◐`   | active  | file written < 30s ago                                            |
 | `○`   | idle    | otherwise                                                         |
 | `✓`   | done    | subagent meta says `finished: true`                               |
+
+The transcript records no line when a permission prompt opens or is answered,
+so `?` is inferred: in a mode that asks, a command you already approved that
+runs longer than 3 seconds also shows `?` until it finishes, and so does one
+your settings allow without asking.
 
 ### Tree keys
 

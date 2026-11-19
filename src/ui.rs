@@ -18,7 +18,7 @@ use ratatui::{
 
 use crate::{
     actors::{self, Scene, Walker, link_rgb},
-    cast::{Cast, fnv32a},
+    cast::Cast,
     format::{age, agent_type, clock, fit, hour_minute, human_tokens, label, local, short_duration, short_id, short_model, usage_detail},
     limits::{AccountUsage, Limit, Limits},
     scan::{Agent, EdgeKind, Kind, Snapshot, Status, Usage, days_from_civil, truncate},
@@ -61,22 +61,10 @@ pub struct App {
     walker: Walker,
     // The accounts' limits on the Usage tab; None shows no Accounts section.
     pub limits: Option<Limits>,
-    // What the card calls each agent instead of its id: an animal, given
-    // when a scan first shows the agent, never changed, never shared.
-    animals: HashMap<String, String>,
+    // What the card calls each agent instead of its id: the file name of
+    // the character it is drawn with, without the extension.
+    names: HashMap<String, String>,
 }
-
-/// The names agents go by on the card.
-const ANIMALS: [&str; 96] = [
-    "otter", "heron", "badger", "falcon", "lynx", "panda", "koala", "gecko", "bison", "moose", "walrus", "beaver",
-    "ferret", "marmot", "puffin", "toucan", "parrot", "pelican", "penguin", "flamingo", "ostrich", "kiwi", "raven", "owl",
-    "hawk", "eagle", "swan", "goose", "sparrow", "finch", "wren", "magpie", "stork", "crane", "ibis", "lemur",
-    "gibbon", "baboon", "tapir", "okapi", "zebra", "giraffe", "hippo", "rhino", "camel", "llama", "alpaca", "yak",
-    "ibex", "gazelle", "impala", "elk", "fox", "wolf", "coyote", "jackal", "hyena", "cheetah", "leopard", "jaguar",
-    "tiger", "lion", "puma", "ocelot", "bobcat", "mink", "stoat", "weasel", "skunk", "raccoon", "wombat", "platypus",
-    "armadillo", "sloth", "hedgehog", "mole", "hare", "squirrel", "chipmunk", "hamster", "seal", "orca", "dolphin", "whale",
-    "shark", "octopus", "squid", "crab", "lobster", "turtle", "iguana", "newt", "frog", "salmon", "bee", "beetle",
-];
 
 fn header_style() -> Style {
     Style::new().fg(Color::Indexed(212)).add_modifier(Modifier::BOLD)
@@ -90,10 +78,19 @@ fn bold() -> Style {
 fn status_color(s: Status) -> Color {
     Color::Indexed(match s {
         Status::Running => 42,
+        Status::Waiting => 208,
         Status::Active => 220,
         Status::Idle => 244,
         Status::Done => 39,
     })
+}
+/// How the tree and the card lead the tool call an agent is in.
+fn doing(s: Status) -> Option<&'static str> {
+    match s {
+        Status::Running => Some("now:"),
+        Status::Waiting => Some("waits on:"),
+        _ => None,
+    }
 }
 fn glyph(s: Status) -> Span<'static> {
     Span::styled(s.glyph(), Style::new().fg(status_color(s)))
@@ -141,25 +138,11 @@ impl App {
             scene: Scene::default(),
             walker: Walker::new(seed),
             limits: None,
-            animals: HashMap::new(),
+            names: HashMap::new(),
         }
     }
 
     pub fn set_snapshot(&mut self, snap: Snapshot) {
-        let mut new: Vec<&String> = snap.by_id.keys().filter(|id| !self.animals.contains_key(*id)).collect();
-        new.sort();
-        for id in new {
-            // The animal the id hashes to, else the next one free; past the
-            // last, the same again with a number.
-            let taken: HashSet<&str> = self.animals.values().map(String::as_str).collect();
-            let at = fnv32a(id) as usize;
-            let name = (1..)
-                .flat_map(|round| (0..ANIMALS.len()).map(move |i| (round, ANIMALS[(at + i) % ANIMALS.len()])))
-                .map(|(round, a)| if round == 1 { a.to_string() } else { format!("{a} {round}") })
-                .find(|n| !taken.contains(n.as_str()))
-                .expect("names never run out");
-            self.animals.insert(id.clone(), name);
-        }
         self.snap = Some(snap);
         self.sync_cursor();
     }
@@ -179,9 +162,18 @@ impl App {
             self.card = false;
             self.focus = sc.roster.first().cloned().unwrap_or_default();
         }
-        let picks = cast.pick(sc.actors.iter().map(|a| (a.id.as_str(), a.kind.as_str())));
-        for (a, p) in sc.actors.iter_mut().zip(picks) {
-            (a.sprite, a.selected) = (p, a.id == self.focus);
+        // One pick over every agent of the scan, drawn or not, and every
+        // actor (the pet too): the sprite it is drawn with names it on the card.
+        let kinds: HashMap<String, String> = snap
+            .by_id
+            .values()
+            .map(|a| (a.id.clone(), if a.kind == Kind::Session { "session".into() } else { a.agent_type.clone() }))
+            .chain(sc.actors.iter().map(|a| (a.id.clone(), a.kind.clone())))
+            .collect();
+        let picks: HashMap<&str, usize> = kinds.keys().map(String::as_str).zip(cast.pick(kinds.iter().map(|(id, k)| (id.as_str(), k.as_str())))).collect();
+        self.names = picks.iter().map(|(&id, &p)| (id.to_string(), cast.name(p).to_string())).collect();
+        for a in &mut sc.actors {
+            (a.sprite, a.selected) = (picks[a.id.as_str()], a.id == self.focus);
         }
         self.scene = sc;
     }
@@ -358,11 +350,12 @@ impl App {
             None => vec![Span::styled("claude-monitor", header_style()), Span::raw("  scanning…")],
             Some(snap) => {
                 let running = snap.by_id.values().filter(|a| a.status == Status::Running).count();
+                let waiting = snap.by_id.values().filter(|a| a.status == Status::Waiting).count();
                 let since = if self.since > 0 { short_duration(self.since) } else { "all".into() };
                 vec![
                     Span::styled("claude-monitor", header_style()),
                     Span::raw(format!(
-                        "  sessions {} · agents {} · running {running}  │  scanned {}  │  since {since}",
+                        "  sessions {} · agents {} · running {running} · waiting {waiting}  │  scanned {}  │  since {since}",
                         snap.roots.len(),
                         snap.by_id.len(),
                         clock(snap.scanned_at)
@@ -449,8 +442,8 @@ impl App {
             Line::raw(format!("turns {} · tokens {} ({})", a.turns, human_tokens(a.usage.total()), usage_detail(a.usage))),
             Line::raw(format!("last activity {} ago", age(snap.scanned_at, a.last_activity))),
         ];
-        if a.status == Status::Running {
-            out.push(Line::styled(format!("now: {}", a.last_tool), Style::new().fg(status_color(Status::Running)).add_modifier(Modifier::BOLD)));
+        if let Some(now) = doing(a.status) {
+            out.push(Line::styled(format!("{now} {}", a.last_tool), Style::new().fg(status_color(a.status)).add_modifier(Modifier::BOLD)));
         }
         out.push(Line::raw(""));
         out.push(Line::styled("Recent events", bold()));
@@ -476,16 +469,17 @@ impl App {
         }
     }
 
-    /// The animal an agent goes by on the card (its short id, for one no scan showed).
-    fn animal<'a>(&'a self, id: &'a str) -> &'a str {
-        self.animals.get(id).map_or_else(|| short_id(id), String::as_str)
+    /// The character name an agent goes by on the card (its short id, for
+    /// one no scan showed).
+    fn name_of<'a>(&'a self, id: &'a str) -> &'a str {
+        self.names.get(id).map_or_else(|| short_id(id), String::as_str)
     }
 
-    /// Another agent on the card: "lead" for a session, else its animal.
+    /// Another agent on the card: "lead" for a session, else its name.
     fn who(&self, id: &str) -> String {
         match self.agent(id) {
             Some(a) if a.kind == Kind::Session => "lead".into(),
-            _ => self.animal(id).into(),
+            _ => self.name_of(id).into(),
         }
     }
 
@@ -495,7 +489,7 @@ impl App {
     fn without_ids(&self, s: &str) -> String {
         let named = |w: &str| {
             let bare = w.trim_end_matches('…');
-            let id = self.animals.keys().find(|id| bare.len() >= 8 && id.starts_with(bare))?;
+            let id = self.snap.as_ref()?.by_id.keys().find(|id| bare.len() >= 8 && id.starts_with(bare))?;
             Some(self.who(id))
         };
         s.split(' ').map(|w| named(w).unwrap_or_else(|| w.to_string())).collect::<Vec<_>>().join(" ")
@@ -512,11 +506,11 @@ impl App {
             Kind::Subagent if a.agent_type.is_empty() => "subagent".to_string(),
             Kind::Subagent => format!("subagent · {}", a.agent_type),
         };
-        // Its animal, then what it is about: a subagent's description, a session's title or project.
+        // Its name, then what it is about: a subagent's description, a session's title or project.
         let name = match (a.kind, a.title.is_empty()) {
-            (Kind::Session, true) => format!("{} ({})", self.animal(&a.id), a.project),
-            (_, true) => self.animal(&a.id).to_string(),
-            (_, false) => format!("{} · {}", self.animal(&a.id), a.title),
+            (Kind::Session, true) => format!("{} ({})", self.name_of(&a.id), a.project),
+            (_, true) => self.name_of(&a.id).to_string(),
+            (_, false) => format!("{} · {}", self.name_of(&a.id), a.title),
         };
         let mut out = vec![
             Line::from(vec![glyph(a.status), Span::raw(" "), Span::styled(name, bold())]),
@@ -524,10 +518,10 @@ impl App {
             Line::raw(format!("{} · {}", short_model(&a.model), a.status.name())),
             Line::styled(format!("last activity {} ago", age(now, a.last_activity)), faint()),
         ];
-        if a.status == Status::Running {
-            // What it runs now, wrapped over at most 3 lines.
-            let (w, now_style) = (usize::from(CARD_W) - 4, Style::new().fg(status_color(Status::Running)).add_modifier(Modifier::BOLD));
-            let text: Vec<char> = format!("now: {}", self.without_ids(&a.last_tool)).chars().collect();
+        if let Some(now) = doing(a.status) {
+            // What it runs or waits on now, wrapped over at most 3 lines.
+            let (w, now_style) = (usize::from(CARD_W) - 4, Style::new().fg(status_color(a.status)).add_modifier(Modifier::BOLD));
+            let text: Vec<char> = format!("{now} {}", self.without_ids(&a.last_tool)).chars().collect();
             let lines: Vec<String> = text.chunks(w).map(|c| c.iter().collect()).collect();
             for (i, l) in lines.iter().take(3).enumerate() {
                 let l = if i == 2 && lines.len() > 3 { truncate(&format!("{l}…"), w) } else { l.clone() };
@@ -940,7 +934,7 @@ mod tests {
         let pane = Rect::new(0, 0, 140, 40);
         let card = card(app.card_lines(38), Rect::new(10, 5, 8, 6), pane);
         let text = rows_of(&card).join("\n");
-        let a1 = format!("{} · a1 title", app.animal("a1"));
+        let a1 = format!("{} · a1 title", app.name_of("a1"));
         for want in [a1.as_str(), "role: subagent · Explore", "opus-4-5 · running", "last activity 10s ago", "now: Bash: cargo test", "did:", "with:"] {
             assert!(text.contains(want), "{want:?} not in\n{text}");
         }
@@ -948,7 +942,7 @@ mod tests {
         for unwanted in ["token", "turns", "in 10", "out 20", "cache"] {
             assert!(!text.contains(unwanted), "{unwanted:?} in\n{text}");
         }
-        // Newest first, names resolved: the lead is "lead", others their animal.
+        // Newest first, names resolved: the lead is "lead", others their name.
         let at = |s: &str| text.find(s).unwrap_or_else(|| panic!("{s:?} not in\n{text}"));
         assert!(at(&format!("{} reply: found it", clock(102 * SEC))) < at(&format!("{} Bash: cargo test", clock(101 * SEC))), "{text}");
         assert!(at("message to lead 3s \"the bug is in parse\"") < at("spawned by lead 5s"), "{text}");
@@ -957,18 +951,19 @@ mod tests {
         app.focus = "s1".into();
         let text = app.card_lines(38).iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
         assert!(text.contains("role: session lead\nopus-4-5 · active\n"), "{text}");
-        let (n1, n2) = (app.animal("a1"), app.animal("a2"));
+        let (n1, n2) = (app.name_of("a1"), app.name_of("a2"));
         let want = [format!("handback from {n2} "), format!("message from {n1} "), format!("spawned {n2} "), format!("spawned {n1} ")];
         let order: Vec<usize> = want.iter().map(|s| text.find(s.as_str()).unwrap_or_else(|| panic!("{s:?} not in\n{text}"))).collect();
         assert!(order.is_sorted(), "newest first: {order:?}\n{text}");
         assert!(text.contains("did:\n(none)"), "{text}");
     }
 
-    /// The card calls every agent by an animal, never its id: in its first
-    /// line, in what it did (ids cut short too) and in whom it dealt with.
-    /// Each agent keeps its animal from scan to scan, and no two share one.
+    /// The card calls every agent by the file name of its character, without
+    /// the extension and as written, never its id: in its first line, in
+    /// what it did (ids cut short too) and in whom it dealt with. The name is
+    /// the sprite it is drawn with, and agents not drawn are named too.
     #[test]
-    fn card_names_agents_by_animals_not_ids() {
+    fn card_names_agents_by_character_file_not_ids() {
         use crate::scan::Event;
         let (lead, sub, peer) = ("2ac51449-c1e2-4e4b-a850-045b77a0fca3", "a5582ca84087f834d", "a90e3abd17305b7ae");
         let mut s = Snapshot { roots: vec![lead.into()], scanned_at: 110 * SEC, ..Snapshot::default() };
@@ -979,11 +974,26 @@ mod tests {
         for x in [agent(lead, "", Status::Active), a, agent(peer, lead, Status::Idle)] {
             s.by_id.insert(x.id.clone(), x);
         }
+        let dir = std::env::temp_dir().join(format!("office-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let px = image::RgbaImage::from_pixel(2, 3, [1, 2, 3, 255].into());
+        for f in ["Luffy.png", "nami.png", "session.png"] {
+            px.save(dir.join(f)).unwrap();
+        }
+        let mut cast = Cast::load(&dir, true, None);
+        let _ = std::fs::remove_dir_all(&dir);
         let mut app = App::new(0, 1);
-        app.set_snapshot(s.clone());
-        let names: Vec<String> = [lead, sub, peer].iter().map(|id| app.animal(id).to_string()).collect();
-        assert!(names.iter().all(|n| ANIMALS.contains(&n.as_str())), "{names:?}");
-        assert_eq!(names.iter().collect::<HashSet<_>>().len(), 3, "{names:?}");
+        app.set_snapshot(s);
+        app.refresh_scene(110 * SEC, 0.0, &mut cast);
+        let names: Vec<String> = [lead, sub, peer].iter().map(|id| app.name_of(id).to_string()).collect();
+        assert_eq!(names[0], "session", "the lead takes the file named after its type");
+        assert!(["Luffy", "nami"].contains(&names[1].as_str()) && ["Luffy", "nami"].contains(&names[2].as_str()), "{names:?}");
+        for a in &app.scene.actors {
+            if a.id != actors::PET {
+                assert_eq!(cast.name(a.sprite), app.name_of(&a.id), "the name is the sprite drawn");
+            }
+        }
 
         app.focus = sub.into();
         let text = app.card_lines(38).iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
@@ -992,17 +1002,7 @@ mod tests {
         assert!(text.contains(&format!("now: SendMessage: to {}", names[2])) && text.contains("SendMessage: to lead"), "{text}");
         app.focus = lead.into();
         let text = app.card_lines(38).iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
-        assert!(text.lines().next().is_some_and(|l| l.contains(&format!(" {} · ", names[0]))), "the lead's animal leads its card:\n{text}");
-
-        // A later scan with more agents, even many more than there are animals, renames no one.
-        for i in 0..150 {
-            let x = agent(&format!("a{i:016x}"), lead, Status::Idle);
-            s.by_id.insert(x.id.clone(), x);
-        }
-        app.set_snapshot(s.clone());
-        assert_eq!([lead, sub, peer].map(|id| app.animal(id).to_string()).to_vec(), names);
-        let all: HashSet<&str> = s.by_id.keys().map(|id| app.animal(id)).collect();
-        assert_eq!(all.len(), s.by_id.len(), "two agents share an animal");
+        assert!(text.lines().next().is_some_and(|l| l.contains(" session · ")), "the lead's name leads its card:\n{text}");
     }
 
     /// A short pane keeps the card's sections, with fewer lines in each.
