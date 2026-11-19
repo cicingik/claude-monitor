@@ -78,6 +78,11 @@ Pick the archive for your system:
 
    `~/.local/bin` must be on your `PATH`.
 
+`command not found` (on Arch, pacman's `database file for '...' does not exist`)
+or `permission denied` means the shell never started office: it is not on your
+`PATH` (run `./office` from its folder), or a bare binary sent without the
+archive lost its executable bit (run `chmod +x office`).
+
 #### Windows
 
 1. Download the `.zip` and `SHA256SUMS`.
