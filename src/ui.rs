@@ -4,29 +4,35 @@
 //! The office view is the picture alone; its only text is
 //! the card, while it is open.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    cell::Cell,
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use ratatui::{
-    Frame,
-    buffer::Buffer,
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
-    layout::Rect,
     style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Padding, Paragraph, Widget},
+    text::Span,
 };
 
 use crate::{
-    actors::{self, Scene, Walker, link_rgb},
+    actors::{self, Scene, Walker},
+    bridge::{self, Ask},
     cast::Cast,
-    format::{age, agent_type, clock, fit, hour_minute, human_tokens, label, local, short_duration, short_id, short_model, usage_detail},
-    limits::{AccountUsage, Limit, Limits},
-    scan::{Agent, EdgeKind, Kind, Snapshot, Status, Usage, days_from_civil, truncate},
+    commands::Command,
+    edit::LineEdit,
+    limits::Limits,
+    scan::{Agent, Kind, Snapshot, Status},
 };
 
+mod card;
+mod draw;
+mod panel;
+
+pub use card::card;
+
 const TABS: [&str; 3] = ["Activity", "Interactions", "Usage"];
-/// The widest a card gets, border and padding included.
-const CARD_W: u16 = 56;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
@@ -41,6 +47,16 @@ pub enum Action {
     Quit,
     Rescan,
     Switched, // the view changed: clear the screen and the images
+    RunHere(Here), // hand the terminal to `claude --resume` until it exits
+}
+
+/// A session to resume in office's own terminal, for what a background
+/// session cannot do: ask whether to trust its folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Here {
+    pub session: String,
+    pub cwd: String,
+    pub config_dir: PathBuf,
 }
 
 pub struct App {
@@ -64,11 +80,39 @@ pub struct App {
     // What the card calls each agent instead of its id: the file name of
     // the character it is drawn with, without the extension.
     names: HashMap<String, String>,
+    // The prompt panel under the tree, for the session of the selected row.
+    pub bridge: PathBuf, // bridge::dir(), a temporary one in tests
+    pub hooks: bool,     // office's hooks are in a Claude Code settings.json
+    typing: bool,        // keys go to the panel, not the tree
+    input: LineEdit,
+    commands: Vec<Command>,                  // the panel session's slash commands
+    commands_for: Option<(PathBuf, String)>, // its config dir and cwd: commands is theirs
+    menu_at: usize,
+    log_scroll: usize,     // how many lines the conversation is scrolled up from its newest
+    log_max: Cell<usize>,  // how far it can be, as last drawn
+    log_for: String,       // the session the scroll is for: another starts at the newest                           // the command picked in the menu of those matching the input
+    note: String,     // what the last prompt or answer did
+    ask: Option<Ask>, // the session's permission request waiting for an answer
+    queued: bool,     // a prompt left for the session, not taken yet
+    picks: Vec<String>, // answers given so far to the questions of the ask with id picks_for
+    picks_for: String,
+    live: bool, // a running Claude Code process holds the session
+    resuming: Option<Resuming>,
+    here_for: Option<Here>, // the session whose background resume needs a terminal: o runs it here
 }
 
-fn header_style() -> Style {
-    Style::new().fg(Color::Indexed(212)).add_modifier(Modifier::BOLD)
+/// A `claude --resume --bg` until it returns, and what explains its result.
+struct Resuming {
+    session: String,
+    child: std::process::Child,
+    cwd: String,
+    config_dir: PathBuf,
 }
+
+/// The fewest rows of the prompt panel, borders included; it takes two thirds
+/// of the left column when there is room.
+const PANEL_H: u16 = 9;
+
 fn faint() -> Style {
     Style::new().add_modifier(Modifier::DIM)
 }
@@ -84,6 +128,7 @@ fn status_color(s: Status) -> Color {
         Status::Done => 39,
     })
 }
+
 /// How the tree and the card lead the tool call an agent is in.
 fn doing(s: Status) -> Option<&'static str> {
     match s {
@@ -94,19 +139,6 @@ fn doing(s: Status) -> Option<&'static str> {
 }
 fn glyph(s: Status) -> Span<'static> {
     Span::styled(s.glyph(), Style::new().fg(status_color(s)))
-}
-
-/// The bubbles help line: "key desc • key desc".
-fn help(keys: &[(&str, &str)]) -> Vec<Span<'static>> {
-    let mut out = Vec::new();
-    for (i, (k, d)) in keys.iter().enumerate() {
-        if i > 0 {
-            out.push(Span::styled(" • ", faint()));
-        }
-        out.push(Span::styled(k.to_string(), Style::new().fg(Color::Indexed(250))));
-        out.push(Span::styled(format!(" {d}"), faint()));
-    }
-    out
 }
 
 /// The element d steps from cur in ids, wrapping around.
@@ -139,7 +171,35 @@ impl App {
             walker: Walker::new(seed),
             limits: None,
             names: HashMap::new(),
+            bridge: bridge::dir(),
+            hooks: false,
+            typing: false,
+            input: LineEdit::default(),
+            commands: Vec::new(),
+            commands_for: None,
+            menu_at: 0,
+            log_scroll: 0,
+            log_max: Cell::new(0),
+            log_for: String::new(),
+            note: String::new(),
+            ask: None,
+            queued: false,
+            picks: Vec::new(),
+            picks_for: String::new(),
+            live: false,
+            resuming: None,
+            here_for: None,
         }
+    }
+
+    /// The mouse wheel: it scrolls the conversation while the panel has the
+    /// keys, else it moves the tree's cursor or the office's focus as ↑/↓ do.
+    pub fn wheel(&mut self, up: bool) -> Action {
+        if self.typing && self.view == View::Tree {
+            self.scroll_log(if up { 3 } else { -3 });
+            return Action::None;
+        }
+        self.key(KeyEvent::from(if up { KeyCode::Up } else { KeyCode::Down }))
     }
 
     pub fn set_snapshot(&mut self, snap: Snapshot) {
@@ -181,6 +241,9 @@ impl App {
     /// Handles a key press.
     pub fn key(&mut self, k: KeyEvent) -> Action {
         let ctrl_c = k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
+        if self.typing && self.view == View::Tree && !ctrl_c {
+            return self.panel_key(k);
+        }
         if k.code == KeyCode::Esc && self.card {
             self.card = false;
             return Action::None;
@@ -212,6 +275,12 @@ impl App {
     fn office_key(&mut self, code: KeyCode) -> Action {
         match code {
             KeyCode::Char('i') => self.card = !self.card,
+            // The tree, on the selected agent, typing in its session's panel.
+            KeyCode::Char('p') => {
+                let action = self.office_key(KeyCode::Enter);
+                self.typing = true;
+                return action;
+            }
             KeyCode::Char('v') => {
                 (self.view, self.card) = (View::Tree, false);
                 return Action::Switched;
@@ -250,6 +319,8 @@ impl App {
                 }
             }
             KeyCode::Tab => self.tab = (self.tab + 1) % TABS.len(),
+            KeyCode::Char('p') => self.typing = true,
+            KeyCode::Char('o') => return self.resume(),
             KeyCode::Char(c @ '1'..='3') => self.tab = c as usize - '1' as usize,
             KeyCode::Char('v') => {
                 self.view = View::Office;
@@ -283,8 +354,15 @@ impl App {
         out
     }
 
+    /// Rows of the tree's box and of the panel's under it, borders included.
+    fn left_heights(&self) -> (u16, u16) {
+        let body = self.height.saturating_sub(2).max(4);
+        let panel = (body * 2 / 3).max(PANEL_H).min(body.saturating_sub(5));
+        (body - panel, panel)
+    }
+
     fn tree_height(&self) -> usize {
-        usize::from(self.height.saturating_sub(2).max(4)) - 2
+        usize::from(self.left_heights().0.max(3)) - 2
     }
 
     fn move_cursor(&mut self, d: isize) {
@@ -329,484 +407,18 @@ impl App {
             self.offset = self.cursor + 1 - h;
         }
     }
-
-    /// Draws the tree view.
-    pub fn draw(&mut self, f: &mut Frame) {
-        let area = f.area();
-        self.height = area.height;
-        // The pane may have changed since the cursor last moved, while the office was shown.
-        self.scroll_to_cursor();
-        self.draw_tree(f, area);
-    }
-
-    fn line(f: &mut Frame, area: Rect, y: u16, spans: Vec<Span<'static>>) {
-        if y < area.bottom() {
-            f.render_widget(Paragraph::new(Line::from(spans)), Rect::new(area.x, y, area.width, 1));
-        }
-    }
-
-    fn draw_tree(&self, f: &mut Frame, area: Rect) {
-        let header = match &self.snap {
-            None => vec![Span::styled("claude-monitor", header_style()), Span::raw("  scanning…")],
-            Some(snap) => {
-                let running = snap.by_id.values().filter(|a| a.status == Status::Running).count();
-                let waiting = snap.by_id.values().filter(|a| a.status == Status::Waiting).count();
-                let since = if self.since > 0 { short_duration(self.since) } else { "all".into() };
-                vec![
-                    Span::styled("claude-monitor", header_style()),
-                    Span::raw(format!(
-                        "  sessions {} · agents {} · running {running} · waiting {waiting}  │  scanned {}  │  since {since}",
-                        snap.roots.len(),
-                        snap.by_id.len(),
-                        clock(snap.scanned_at)
-                    )),
-                ]
-            }
-        };
-        Self::line(f, area, area.y, header);
-        let body_h = area.height.saturating_sub(2).max(4).min(area.height.saturating_sub(1));
-        let lw = (area.width / 2).max(30).min(area.width.saturating_sub(24).max(30)).min(area.width);
-        let rw = area.width.saturating_sub(lw);
-        let block = || Block::new().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::new().fg(Color::Indexed(240)));
-        let left = Rect::new(area.x, area.y + 1, lw, body_h);
-        let right = Rect::new(area.x + lw, area.y + 1, rw, body_h);
-        f.render_widget(Paragraph::new(self.tree_lines(usize::from(lw.saturating_sub(2)))).block(block()), left);
-        if rw > 2 {
-            f.render_widget(Paragraph::new(self.detail_lines(usize::from(rw - 2))).block(block()), right);
-        }
-        let keys = [("↑/k", "up"), ("↓/j", "down"), ("enter", "collapse/expand"), ("tab", "next tab"), ("1-3", "tab"), ("v", "office"), ("r", "rescan"), ("q", "quit")];
-        Self::line(f, area, area.y + 1 + body_h, help(&keys));
-    }
-
-    fn tree_lines(&self, w: usize) -> Vec<Line<'static>> {
-        let rows = self.rows();
-        if rows.is_empty() {
-            return vec![Line::styled("no sessions in the time window", faint())];
-        }
-        let now = self.snap.as_ref().map_or(0, |s| s.scanned_at);
-        let end = (self.offset + self.tree_height()).min(rows.len());
-        (self.offset..end)
-            .map(|i| {
-                let (a, depth) = rows[i];
-                let caret = match (a.children.is_empty(), self.collapsed.contains(&a.id)) {
-                    (true, _) => " ",
-                    (false, true) => "▸",
-                    (false, false) => "▾",
-                };
-                let prefix = format!("{}{caret} ", "  ".repeat(depth));
-                let mut cols = format!(" {} {:>6} {:>4}", fit(&short_model(&a.model), 10), human_tokens(a.usage.total()), age(now, a.last_activity));
-                if w >= 60 {
-                    cols = format!(" {}{cols}", fit(agent_type(a), 15));
-                }
-                let name = if a.kind == Kind::Session { format!("{} [{}]", label(a), a.config) } else { label(a) };
-                let title = fit(&name, w.saturating_sub(prefix.chars().count() + 2 + cols.chars().count()));
-                if i == self.cursor {
-                    let sel = Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD);
-                    return Line::styled(format!("{prefix}{} {title}{cols}", a.status.glyph()), sel);
-                }
-                Line::from(vec![Span::styled(prefix, faint()), glyph(a.status), Span::raw(format!(" {title}")), Span::styled(cols, faint())])
-            })
-            .collect()
-    }
-
-    fn detail_lines(&self, w: usize) -> Vec<Line<'static>> {
-        let mut tabs = Vec::new();
-        for (i, n) in TABS.iter().enumerate() {
-            if i > 0 {
-                tabs.push(Span::raw(" "));
-            }
-            let style = if i == self.tab { Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD) } else { faint() };
-            tabs.push(Span::styled(format!(" {} {n} ", i + 1), style));
-        }
-        let mut out = vec![Line::from(tabs), Line::styled("─".repeat(w), faint())];
-        if self.tab == 2 {
-            out.extend(self.accounts(w));
-        }
-        let (Some(snap), Some(a)) = (&self.snap, self.agent(&self.selected)) else {
-            out.push(Line::styled("nothing selected", faint()));
-            return out;
-        };
-        out.extend(match self.tab {
-            1 => self.interactions(snap, a),
-            2 => self.usage(snap, a, w),
-            _ => self.activity(snap, a),
-        });
-        out
-    }
-
-    fn activity(&self, snap: &Snapshot, a: &Agent) -> Vec<Line<'static>> {
-        let mut out = vec![
-            Line::from(vec![glyph(a.status), Span::raw(" "), Span::styled(label(a), bold())]),
-            Line::raw(format!("{} · {} · {} · {} · {}", agent_type(a), short_model(&a.model), a.status.name(), a.project, a.config)),
-            Line::styled(format!("id {}", a.id), faint()),
-            Line::raw(format!("turns {} · tokens {} ({})", a.turns, human_tokens(a.usage.total()), usage_detail(a.usage))),
-            Line::raw(format!("last activity {} ago", age(snap.scanned_at, a.last_activity))),
-        ];
-        if let Some(now) = doing(a.status) {
-            out.push(Line::styled(format!("{now} {}", a.last_tool), Style::new().fg(status_color(a.status)).add_modifier(Modifier::BOLD)));
-        }
-        out.push(Line::raw(""));
-        out.push(Line::styled("Recent events", bold()));
-        if a.events.is_empty() {
-            out.push(Line::styled("  (none)", faint()));
-        }
-        for e in a.events.iter().rev() {
-            let kind = match e.kind {
-                "tool_use" => "tool",
-                "text" => "reply",
-                k => k,
-            };
-            out.push(Line::from(vec![Span::styled(clock(e.at), faint()), Span::raw(format!(" {} {}", fit(kind, 8), e.summary))]));
-        }
-        out
-    }
-
-    /// The short display form of an agent id in edges and the graph.
-    fn name(&self, id: &str) -> String {
-        match self.agent(id) {
-            Some(a) => format!("{} {}", short_id(id), agent_type(a)),
-            None => id.into(),
-        }
-    }
-
-    /// The character name an agent goes by on the card (its short id, for
-    /// one no scan showed).
-    fn name_of<'a>(&'a self, id: &'a str) -> &'a str {
-        self.names.get(id).map_or_else(|| short_id(id), String::as_str)
-    }
-
-    /// Another agent on the card: "lead" for a session, else its name.
-    fn who(&self, id: &str) -> String {
-        match self.agent(id) {
-            Some(a) if a.kind == Kind::Session => "lead".into(),
-            _ => self.name_of(id).into(),
-        }
-    }
-
-    /// s with each word that is an agent's id, or 8 or more characters of
-    /// its start (cut short, as in "SendMessage: to a5582ca8…"), given as who
-    /// it is.
-    fn without_ids(&self, s: &str) -> String {
-        let named = |w: &str| {
-            let bare = w.trim_end_matches('…');
-            let id = self.snap.as_ref()?.by_id.keys().find(|id| bare.len() >= 8 && id.starts_with(bare))?;
-            Some(self.who(id))
-        };
-        s.split(' ').map(|w| named(w).unwrap_or_else(|| w.to_string())).collect::<Vec<_>>().join(" ")
-    }
-
-    /// The selected agent's card in at most `rows` lines: who it is (its
-    /// role), what it did and whom it dealt with,
-    /// newest first: the last 3 things it did, up to 8 dealings. No tokens: those are in the tree.
-    pub fn card_lines(&self, rows: usize) -> Vec<Line<'static>> {
-        let (Some(snap), Some(a)) = (&self.snap, self.agent(&self.focus)) else { return vec![Line::styled("nothing selected", faint())] };
-        let now = snap.scanned_at;
-        let role = match a.kind {
-            Kind::Session => "session lead".to_string(),
-            Kind::Subagent if a.agent_type.is_empty() => "subagent".to_string(),
-            Kind::Subagent => format!("subagent · {}", a.agent_type),
-        };
-        // Its name, then what it is about: a subagent's description, a session's title or project.
-        let name = match (a.kind, a.title.is_empty()) {
-            (Kind::Session, true) => format!("{} ({})", self.name_of(&a.id), a.project),
-            (_, true) => self.name_of(&a.id).to_string(),
-            (_, false) => format!("{} · {}", self.name_of(&a.id), a.title),
-        };
-        let mut out = vec![
-            Line::from(vec![glyph(a.status), Span::raw(" "), Span::styled(name, bold())]),
-            Line::raw(truncate(&format!("role: {role}"), usize::from(CARD_W) - 4)),
-            Line::raw(format!("{} · {}", short_model(&a.model), a.status.name())),
-            Line::styled(format!("last activity {} ago", age(now, a.last_activity)), faint()),
-        ];
-        if let Some(now) = doing(a.status) {
-            // What it runs or waits on now, wrapped over at most 3 lines.
-            let (w, now_style) = (usize::from(CARD_W) - 4, Style::new().fg(status_color(a.status)).add_modifier(Modifier::BOLD));
-            let text: Vec<char> = format!("{now} {}", self.without_ids(&a.last_tool)).chars().collect();
-            let lines: Vec<String> = text.chunks(w).map(|c| c.iter().collect()).collect();
-            for (i, l) in lines.iter().take(3).enumerate() {
-                let l = if i == 2 && lines.len() > 3 { truncate(&format!("{l}…"), w) } else { l.clone() };
-                out.push(Line::styled(l, now_style));
-            }
-        }
-        let did: Vec<Line<'static>> = a
-            .events
-            .iter()
-            .rev()
-            .map(|e| {
-                let what = match e.kind {
-                    "text" => format!("reply: {}", e.summary),
-                    "prompt" => format!("prompt: {}", e.summary),
-                    _ => e.summary.clone(),
-                };
-                let what = self.without_ids(&what);
-                Line::from(vec![Span::styled(clock(e.at), faint()), Span::raw(format!(" {what}"))])
-            })
-            .collect();
-        let with: Vec<Line<'static>> = snap
-            .edges
-            .iter()
-            .rev()
-            .filter_map(|e| {
-                let (verb, other) = if e.from == a.id {
-                    (["spawned", "message to", "handback to"], &e.to)
-                } else if e.to == a.id {
-                    (["spawned by", "message from", "handback from"], &e.from)
-                } else {
-                    return None;
-                };
-                let verb = verb[match e.kind {
-                    EdgeKind::Spawn => 0,
-                    EdgeKind::Message => 1,
-                    EdgeKind::Handback => 2,
-                }];
-                let [r, g, b] = link_rgb(e.kind);
-                let mut l = vec![Span::styled(verb, Style::new().fg(Color::Rgb(r, g, b))), Span::raw(format!(" {}", self.who(other))), Span::styled(format!(" {}", age(now, e.at)), faint())];
-                if e.kind == EdgeKind::Message && !e.label.is_empty() {
-                    l.push(Span::styled(format!(" \"{}\"", e.label), faint()));
-                }
-                Some(Line::from(l))
-            })
-            .collect();
-        // Fewer events and edges when the pane is short, at least one of each.
-        let (mut nd, mut nw) = (did.len().min(3), with.len().min(8));
-        while out.len() + 2 + nd.max(1) + nw.max(1) > rows && nd.max(nw) > 1 {
-            if nd >= nw { nd -= 1 } else { nw -= 1 }
-        }
-        for (title, lines, n) in [("did:", did, nd), ("with:", with, nw)] {
-            out.push(Line::styled(title, bold()));
-            if n == 0 {
-                out.push(Line::styled("(none)", faint()));
-            }
-            out.extend(lines.into_iter().take(n));
-        }
-        out
-    }
-
-    fn interactions(&self, snap: &Snapshot, a: &Agent) -> Vec<Line<'static>> {
-        let mut out = vec![Line::styled(format!("Edges of {}", short_id(&a.id)), bold())];
-        let before = out.len();
-        for e in &snap.edges {
-            let s = if e.from == a.id {
-                format!("→ {:<8} to   {}", e.kind.name(), self.name(&e.to))
-            } else if e.to == a.id {
-                format!("← {:<8} from {}", e.kind.name(), self.name(&e.from))
-            } else {
-                continue;
-            };
-            let mut l = vec![Span::raw(format!("  {s}"))];
-            if !e.label.is_empty() && e.kind != EdgeKind::Handback {
-                l.push(Span::styled(format!(" \"{}\"", e.label), faint()));
-            }
-            l.push(Span::styled(format!(" {}", hour_minute(e.at)), faint()));
-            out.push(Line::from(l));
-        }
-        if out.len() == before {
-            out.push(Line::styled("  (none)", faint()));
-        }
-        let Some(root) = snap.by_id.get(&a.session_id) else { return out };
-        out.push(Line::raw(""));
-        out.push(Line::styled("Session graph", bold()));
-        out.extend(self.graph(snap, root));
-        out
-    }
-
-    /// The session tree with spawn labels on the branches and each agent's
-    /// outgoing messages and handbacks as annotations.
-    fn graph(&self, snap: &Snapshot, root: &Agent) -> Vec<Line<'static>> {
-        let mut spawn_label: HashMap<&str, &str> = HashMap::new();
-        let mut notes: HashMap<&str, BTreeMap<String, usize>> = HashMap::new();
-        for e in &snap.edges {
-            match e.kind {
-                EdgeKind::Spawn => _ = spawn_label.insert(&e.to, &e.label),
-                EdgeKind::Message => *notes.entry(&e.from).or_default().entry(format!("⇢msg {}", short_id(&e.to))).or_default() += 1,
-                EdgeKind::Handback => *notes.entry(&e.from).or_default().entry(format!("⇠handback {}", short_id(&e.to))).or_default() += 1,
-            }
-        }
-        let annotate = |id: &str| -> Option<Span<'static>> {
-            let n = notes.get(id)?;
-            let parts: Vec<String> = n.iter().map(|(k, c)| format!("[{k} ×{c}]")).collect();
-            Some(Span::styled(format!(" {}", parts.join(" ")), faint()))
-        };
-        let mut first = vec![glyph(root.status), Span::raw(format!(" {} session", short_id(&root.id)))];
-        first.extend(annotate(&root.id));
-        let mut out = vec![Line::from(first)];
-        fn rec(app: &App, snap: &Snapshot, a: &Agent, prefix: &str, labels: &HashMap<&str, &str>, annotate: &dyn Fn(&str) -> Option<Span<'static>>, out: &mut Vec<Line<'static>>) {
-            for (i, c) in a.children.iter().enumerate() {
-                let Some(c) = snap.by_id.get(c) else { continue };
-                let last = i == a.children.len() - 1;
-                let (branch, next) = if last { ("└─", format!("{prefix}   ")) } else { ("├─", format!("{prefix}│  ")) };
-                let mut l = vec![
-                    Span::styled(format!("{prefix}{branch}spawn \"{}\"─▶ ", labels.get(c.id.as_str()).copied().unwrap_or("")), faint()),
-                    glyph(c.status),
-                    Span::raw(format!(" {}", app.name(&c.id))),
-                ];
-                l.extend(annotate(&c.id));
-                out.push(Line::from(l));
-                rec(app, snap, c, &next, labels, annotate, out);
-            }
-        }
-        rec(self, snap, root, "", &spawn_label, &annotate, &mut out);
-        out
-    }
-
-    /// The Accounts section: per account, a bar for its 5-hour and one for
-    /// its 7-day limit, in the session bars' style, or one line saying why
-    /// there are none. Asking for the usage starts its fetching.
-    fn accounts(&self, w: usize) -> Vec<Line<'static>> {
-        let Some(limits) = &self.limits else { return Vec::new() };
-        let usage = limits.usage();
-        let mut head = vec![Span::styled("Accounts", bold())];
-        if let Some(t) = usage.iter().map(|u| u.fetched_at).max().filter(|&t| t > 0) {
-            head.push(Span::styled(format!("  fetched {}", clock(t)), faint()));
-        }
-        let mut out = vec![Line::from(head)];
-        if usage.is_empty() {
-            out.push(Line::styled("  no ~/.claude*/.credentials.json", faint()));
-        }
-        for u in &usage {
-            out.extend(account_lines(u, w));
-        }
-        out.push(Line::raw(""));
-        out
-    }
-
-    fn usage(&self, snap: &Snapshot, a: &Agent, w: usize) -> Vec<Line<'static>> {
-        let root = snap.by_id.get(&a.session_id).unwrap_or(a);
-        let total = snap.subtree_usage(&root.id);
-        let mut out = vec![
-            Line::from(vec![Span::styled(format!("Session {}", short_id(&root.id)), bold()), Span::raw(format!("  total {}", human_tokens(total.total())))]),
-            Line::raw(""),
-        ];
-        let mut peak = 0;
-        let mut by_model: BTreeMap<String, Usage> = BTreeMap::new();
-        let mut members = Vec::new();
-        snap.walk(&root.id, 0, &mut |x, depth| {
-            peak = peak.max(x.usage.total());
-            for (k, u) in &x.model_usage {
-                let t = by_model.entry(k.clone()).or_default();
-                *t = t.add(*u);
-            }
-            members.push((x, depth));
-        });
-        let bar_w = w.saturating_sub(30).max(4);
-        for (x, depth) in members {
-            let n = if peak > 0 { (bar_w as f64 * x.usage.total() as f64 / peak as f64) as usize } else { 0 };
-            out.push(Line::from(vec![
-                Span::raw(format!("{}  ", fit(&format!("{}{}", " ".repeat(depth), label(x)), 20))),
-                Span::styled("█".repeat(n), Style::new().fg(Color::Indexed(63))),
-                Span::styled("░".repeat(bar_w - n), faint()),
-                Span::raw(format!(" {:>6}", human_tokens(x.usage.total()))),
-            ]));
-        }
-        out.push(Line::raw(""));
-        out.push(Line::styled("By model", bold()));
-        let mut models: Vec<_> = by_model.into_iter().collect();
-        models.sort_by(|a, b| b.1.total().cmp(&a.1.total()));
-        for (k, u) in models {
-            out.push(Line::from(vec![
-                Span::raw(format!("  {} {:>7}  ", fit(&short_model(&k), 14), human_tokens(u.total()))),
-                Span::styled(usage_detail(u), faint()),
-            ]));
-        }
-        out.push(Line::raw(""));
-        out.push(Line::from(vec![
-            Span::styled("Session total ", bold()),
-            Span::raw(format!("{}  ", human_tokens(total.total()))),
-            Span::styled(usage_detail(total), faint()),
-        ]));
-        out
-    }
-}
-
-/// One account's rows: `<name> 5h  ████░░  62%  resets 14:10` and
-/// `        7d  ██░░░░  36%  resets Fri 22:00`, else `<name>  <why not>`.
-fn account_lines(u: &AccountUsage, w: usize) -> Vec<Line<'static>> {
-    let name = truncate(&u.name, 16);
-    let why = match (&u.error, u.fetched_at) {
-        (Some(e), _) => Some(e.clone()),
-        (None, 0) => Some("fetching…".into()),
-        _ => None,
-    };
-    if let Some(why) = why {
-        return vec![Line::from(vec![Span::raw(format!("{}  ", fit(&name, 20))), Span::styled(why, faint())])];
-    }
-    // The label column of the session bars; room on the right for "100%  resets Fri 22:00".
-    let bar_w = w.saturating_sub(45).max(4);
-    let pad = " ".repeat(name.chars().count());
-    vec![
-        limit_line(&format!("{name} 5h"), u.five_hour, bar_w, hour_minute),
-        limit_line(&format!("{pad} 7d"), u.seven_day, bar_w, weekday_time),
-    ]
-}
-
-/// A bar of bar_w cells filled to the limit's percent, then the percent
-/// and the reset time as `when` writes it.
-fn limit_line(label: &str, l: Option<Limit>, bar_w: usize, when: fn(i64) -> String) -> Line<'static> {
-    let pct = l.map_or(0.0, |l| l.pct.clamp(0.0, 100.0));
-    let n = ((bar_w as f64 * pct / 100.0) as usize).min(bar_w);
-    let mut spans = vec![
-        Span::raw(format!("{}  ", fit(label, 20))),
-        Span::styled("█".repeat(n), Style::new().fg(Color::Indexed(63))),
-        Span::styled("░".repeat(bar_w - n), faint()),
-        Span::raw(match l {
-            Some(_) => format!(" {:>3}%", pct.round()),
-            None => "    -".into(),
-        }),
-    ];
-    if let Some(t) = l.map(|l| l.resets_at).filter(|&t| t > 0) {
-        spans.push(Span::styled(format!("  resets {}", when(t)), faint()));
-    }
-    Line::from(spans)
-}
-
-/// Fri 22:00 in local time.
-fn weekday_time(t: i64) -> String {
-    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    let l = local(t);
-    // 1970-01-01, day 0, was a Thursday.
-    let day = DAYS[(days_from_civil(l.year, l.month, l.day) + 4).rem_euclid(7) as usize];
-    format!("{day} {:02}:{:02}", l.hour, l.min)
-}
-
-/// Where a card of size (w, h) goes beside anchor, the cells of its agent:
-/// right of it, else left, else below, else above, else at the pane's right
-/// edge; always inside pane.
-pub fn place((w, h): (u16, u16), anchor: Rect, pane: Rect) -> Rect {
-    let (w, h) = (w.min(pane.width), h.min(pane.height));
-    let fit_x = |x: u16| x.clamp(pane.x, pane.right() - w);
-    let fit_y = |y: u16| y.clamp(pane.y, pane.bottom() - h);
-    let (x, y) = if anchor.right().saturating_add(1 + w) <= pane.right() {
-        (anchor.right() + 1, fit_y(anchor.y))
-    } else if anchor.x > pane.x + w {
-        (anchor.x - 1 - w, fit_y(anchor.y))
-    } else if anchor.bottom().saturating_add(h) <= pane.bottom() {
-        (fit_x(anchor.x), anchor.bottom())
-    } else if anchor.y >= pane.y + h {
-        (fit_x(anchor.x), anchor.y - h)
-    } else {
-        (pane.right() - w, fit_y(anchor.y))
-    };
-    Rect::new(x, y, w, h)
-}
-
-/// The card of lines in a box as wide as its widest line (24 to 56 cells),
-/// placed beside anchor inside pane: a buffer of exactly its cells, every
-/// one written, so it hides what is under it.
-pub fn card(lines: Vec<Line<'static>>, anchor: Rect, pane: Rect) -> Buffer {
-    let w = u16::try_from(lines.iter().map(Line::width).max().unwrap_or(0) + 4).unwrap_or(u16::MAX).clamp(24, CARD_W);
-    let h = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
-    let at = place((w, h), anchor, pane);
-    let mut buf = Buffer::empty(at);
-    let block = Block::new().borders(Borders::ALL).border_style(Style::new().fg(Color::Indexed(244))).padding(Padding::horizontal(1));
-    Paragraph::new(lines).block(block).render(at, &mut buf);
-    buf
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::SEC;
-    use ratatui::{Terminal, backend::TestBackend, crossterm::event::KeyEventKind};
+    use super::{card::place, draw::{account_lines, limit_line, weekday_time}};
+    use crate::{
+        format::{clock, fit, hour_minute},
+        limits::{AccountUsage, Limit},
+        scan::{EdgeKind, SEC, Usage},
+    };
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, crossterm::event::KeyEventKind, layout::Rect, text::Line};
 
     fn agent(id: &str, parent: &str, status: Status) -> Agent {
         Agent {
@@ -822,11 +434,16 @@ mod tests {
             status,
             last_activity: 100 * SEC,
             last_tool: "Bash: cargo test".into(),
+            last_text: String::new(),
+            config_dir: Default::default(),
+            cwd: String::new(),
+            asking: String::new(),
             turns: 3,
             usage: Usage { input: 10, output: 20, ..Usage::default() },
             model_usage: [("claude-opus-4-5".to_string(), Usage { input: 10, output: 20, ..Usage::default() })].into(),
             events: Vec::new(),
             children: Vec::new(),
+            live: false,
         }
     }
 
@@ -900,8 +517,8 @@ mod tests {
         let mut s = snap();
         let a1 = s.by_id.get_mut("a1").unwrap();
         a1.events = vec![
-            Event { at: 101 * SEC, kind: "tool_use", tool: "Bash".into(), summary: "Bash: cargo test".into() },
-            Event { at: 102 * SEC, kind: "text", tool: String::new(), summary: "found it".into() },
+            Event { at: 101 * SEC, kind: "tool_use", tool: "Bash".into(), summary: "Bash: cargo test".into(), ..Default::default() },
+            Event { at: 102 * SEC, kind: "text", tool: String::new(), summary: "found it".into(), ..Default::default() },
         ];
         s.edges.push(Edge { from: "s1".into(), to: "a2".into(), kind: EdgeKind::Spawn, at: 106 * SEC, label: "fix".into() });
         s.edges.push(Edge { from: "a1".into(), to: "s1".into(), kind: EdgeKind::Message, at: 107 * SEC, label: "the bug is in parse".into() });
@@ -970,7 +587,7 @@ mod tests {
         let mut a = agent(sub, lead, Status::Running);
         a.title = String::new();
         a.last_tool = format!("SendMessage: to {}…", &peer[..10]);
-        a.events = vec![Event { at: 101 * SEC, kind: "tool_use", tool: "SendMessage".into(), summary: format!("SendMessage: to {lead}") }];
+        a.events = vec![Event { at: 101 * SEC, kind: "tool_use", tool: "SendMessage".into(), summary: format!("SendMessage: to {lead}"), ..Default::default() }];
         for x in [agent(lead, "", Status::Active), a, agent(peer, lead, Status::Idle)] {
             s.by_id.insert(x.id.clone(), x);
         }
@@ -1005,12 +622,244 @@ mod tests {
         assert!(text.lines().next().is_some_and(|l| l.contains(" session · ")), "the lead's name leads its card:\n{text}");
     }
 
+    /// The panel shows what the session asks, from the top, else the end of
+    /// its last reply, in the rows it has, with long lines wrapped at spaces.
+    #[test]
+    fn panel_shows_what_the_session_asks_or_last_said() {
+        let mut snap = busy_snap();
+        let s1 = snap.by_id.get_mut("s1").unwrap();
+        s1.last_text = format!("{}\nShould I also delete the old build directory before rebuilding?", "line\n".repeat(30));
+        let mut app = App::new(0, 1);
+        app.hooks = true;
+        app.set_snapshot(snap.clone());
+        app.selected = "a1".into();
+        let text = |app: &App| app.panel_lines(40, 12).iter().map(Line::to_string).collect::<Vec<_>>();
+        let t = text(&app);
+        assert_eq!(t.len(), 12, "{t:#?}");
+        assert!(t[1].starts_with("↑ ") && t[1].ends_with("more · pgup"), "older lines are above: {t:#?}");
+        let end = t.iter().position(|l| l.starts_with("  Should I")).expect("the reply's end shows, over the box");
+        assert_eq!((t[end].as_str(), t[end + 1].as_str()), ("  Should I also delete the old build", "  directory before rebuilding?"));
+        assert!(t[end + 2].starts_with('╭'), "{t:#?}");
+
+        // Page up shows older lines, page down the newest again.
+        (app.view, app.typing) = (View::Tree, true);
+        app.key(KeyEvent::from(KeyCode::PageUp));
+        let t = text(&app);
+        assert!(!t.iter().any(|l| l.starts_with("  Should I")) && t.iter().any(|l| l.starts_with("↓ ") && l.ends_with("newer · pgdn")), "{t:#?}");
+        app.key(KeyEvent::from(KeyCode::PageDown));
+        assert!(text(&app).iter().any(|l| l.starts_with("  Should I")));
+
+        snap.by_id.get_mut("s1").unwrap().asking = "Which approach?\n  1. Fast — skip the cache\n  2. Safe".into();
+        app.set_snapshot(snap);
+        let t = text(&app);
+        let at = t.iter().position(|l| l == "asks you:").expect("the question shows");
+        assert_eq!(t[at + 1..at + 4], ["Which approach?", "  1. Fast — skip the cache", "  2. Safe"], "{t:#?}");
+        assert!(t[at + 4].starts_with('╭'), "over the input box: {t:#?}");
+    }
+
+    /// The conversation reads as in Claude Code: prompts after `>`, replies
+    /// after `●` whole and wrapped, tool calls on one line.
+    #[test]
+    fn panel_shows_the_conversation() {
+        let mut snap = busy_snap();
+        snap.by_id.get_mut("s1").unwrap().events = vec![
+            crate::scan::Event { kind: "prompt", summary: "fix the build".into(), text: "fix the build".into(), ..Default::default() },
+            crate::scan::Event { kind: "tool_use", tool: "Bash".into(), summary: "Bash: cargo build".into(), ..Default::default() },
+            crate::scan::Event { kind: "text", summary: "Fixed: a missing import".into(), text: "Fixed: a missing import in main.rs, and the tests pass again.".into(), ..Default::default() },
+        ];
+        let mut app = App::new(0, 1);
+        app.hooks = true;
+        app.set_snapshot(snap);
+        app.selected = "s1".into();
+        let t = app.panel_lines(40, 14).iter().map(Line::to_string).collect::<Vec<_>>();
+        let at = t.iter().position(|l| l == "> fix the build").expect("the prompt");
+        assert_eq!(t[at + 1..at + 5], ["● Bash: cargo build", "", "● Fixed: a missing import in main.rs,", "  and the tests pass again."], "{t:#?}");
+    }
+
+    /// A background resume refused for trust offers to run it here: the keys
+    /// go back to the tree, and o hands the terminal to that session.
+    #[test]
+    fn an_untrusted_resume_offers_to_run_it_here() {
+        let mut app = App::new(0, 1);
+        app.view = View::Tree;
+        app.set_snapshot(busy_snap());
+        app.selected = "s1".into();
+        app.typing = true;
+        let child = std::process::Command::new("sh")
+            .args(["-c", "echo 'Workspace not trusted. Run `claude` in /tmp once and accept the trust prompt, then retry.' >&2; exit 1"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        app.resuming = Some(Resuming { session: "s1".into(), child, cwd: "/tmp".into(), config_dir: "/cfg".into() });
+        while app.resuming.is_some() {
+            app.poll_resume();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(app.note.contains("/tmp is not trusted") && app.note.contains("Press o to run it here"), "{}", app.note);
+        assert!(!app.typing, "o is a key of the tree again");
+        let want = Here { session: "s1".into(), cwd: "/tmp".into(), config_dir: "/cfg".into() };
+        assert_eq!(press(&mut app, KeyCode::Char('o')), Action::RunHere(want.clone()));
+        app.ran_here(&want, Ok(std::process::Command::new("true").status().unwrap()));
+        assert!(app.note.starts_with("back from s1"), "{}", app.note);
+        assert!(app.here_for.is_none(), "offered once");
+    }
+
+    /// A long note wraps over several rows instead of being cut to one.
+    #[test]
+    fn panel_note_wraps_whole() {
+        let mut app = App::new(0, 1);
+        app.hooks = true;
+        app.set_snapshot(busy_snap());
+        app.selected = "s1".into();
+        app.note = "not resumed: ~/dev/api is not trusted for this account yet. Run this once in a terminal and accept the trust prompt, then press o again: cd ~/dev/api && claude".into();
+        let t = app.panel_lines(40, 20).iter().map(Line::to_string).collect::<Vec<_>>().join(" ");
+        let note = t.split('╯').nth(1).expect("the note under the input box");
+        assert!(note.contains("cd ~/dev/api && claude") && !note.contains('…'), "{t}");
+    }
+
+    /// A session row is `[account](directory) title`; no row shows the
+    /// model or tokens; subagents keep their type.
+    #[test]
+    fn tree_rows_name_account_directory_and_title() {
+        let mut snap = busy_snap();
+        let s1 = snap.by_id.get_mut("s1").unwrap();
+        (s1.config, s1.project, s1.title) = ("work".into(), "proj".into(), "Fix the bug".into());
+        let mut app = App::new(0, 1);
+        app.set_snapshot(snap);
+        let rows: Vec<String> = app.tree_lines(80).iter().map(Line::to_string).collect();
+        let s = rows.iter().find(|r| r.contains("[work](proj) Fix the bug")).unwrap_or_else(|| panic!("{rows:#?}"));
+        assert!(!s.contains("opus") && !s.contains("session"), "{s}");
+        assert!(rows.iter().all(|r| !r.contains("opus") && !r.contains("tok")), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("Explore")), "subagents keep their type: {rows:#?}");
+    }
+
+    /// A waiting AskUserQuestion shows its question and numbered options; a
+    /// digit picks an option, typed text answers in one's own words, and
+    /// the last answer goes to the hook as question → answer.
+    #[test]
+    fn panel_answers_a_question_by_picking() {
+        let root = std::env::temp_dir().join(format!("office-pick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("s1")).unwrap();
+        std::fs::write(root.join("s1").join("ask-7.json"), r#"{"summary":"AskUserQuestion: Color?","questions":[
+            {"question":"Color?","options":[{"label":"Red","description":"warm"},{"label":"Blue"}]},
+            {"question":"Size?","options":[{"label":"S"},{"label":"L"}]}]}"#).unwrap();
+        let mut app = App::new(0, 1);
+        (app.bridge, app.hooks) = (root.clone(), true);
+        app.set_snapshot(busy_snap());
+        app.focus = "s1".into();
+        press(&mut app, KeyCode::Char('p'));
+        app.poll_bridge();
+        let text = app.panel_lines(50, 20).iter().map(Line::to_string).collect::<Vec<_>>();
+        let at = text.iter().position(|l| l == "asks you (1 of 2):").unwrap_or_else(|| panic!("{text:#?}"));
+        assert_eq!(text[at + 1..at + 4], ["Color?", "  1. Red — warm", "  2. Blue"]);
+        assert!(!text.iter().any(|l| l.contains("1 yes")), "no yes/no for a question: {text:#?}");
+        press(&mut app, KeyCode::Char('2'));
+        let text = app.panel_lines(50, 20).iter().map(Line::to_string).collect::<Vec<_>>();
+        assert!(text.contains(&"asks you (2 of 2):".to_string()) && text.contains(&"Size?".to_string()), "{text:#?}");
+        for c in "medium".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        let got: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("s1").join("answer-7.json")).unwrap()).unwrap();
+        assert_eq!(got, serde_json::json!({ "answers": { "Color?": "Blue", "Size?": "medium" } }));
+        assert!(!root.join("s1").join("prompt.txt").exists(), "an answer, not a prompt");
+        assert_eq!(app.note, "answered: Blue · medium");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A slash shows the session's commands: ↓ picks, tab completes, enter
+    /// sends the picked one as its file to follow, a built-in stays typed,
+    /// and ←/→ move the cursor to edit inside the prompt.
+    #[test]
+    fn slash_opens_a_command_menu_and_the_cursor_edits_inside_the_prompt() {
+        let root = std::env::temp_dir().join(format!("office-menu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut app = App::new(0, 1);
+        (app.bridge, app.hooks) = (root.clone(), true);
+        app.set_snapshot(busy_snap());
+        app.focus = "a1".into();
+        press(&mut app, KeyCode::Char('p'));
+        let s = app.panel_session().cloned().unwrap();
+        let cmd = |n: &str, file: Option<&str>| Command { name: n.into(), about: format!("{n} it"), file: file.map(PathBuf::from) };
+        app.commands = vec![cmd("compact", None), cmd("pstack:poteto-mode", Some("/p/poteto-mode/SKILL.md")), cmd("pstack:polish", Some("/p/polish/SKILL.md"))];
+        app.commands_for = Some((s.config_dir.clone(), s.cwd.clone()));
+        app.poll_bridge();
+        for c in "/po".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let text = app.panel_lines(60, 30).iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("› /pstack:poteto-mode  pstack:poteto-mode it") && text.contains("  /pstack:polish"), "{text}");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.input.text(), "/pstack:polish ");
+        for c in "the bug".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        for _ in 0..7 {
+            press(&mut app, KeyCode::Left);
+        }
+        for c in "fix ".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.input.text(), "/pstack:polish fix the bug");
+        press(&mut app, KeyCode::Enter);
+        let sent = std::fs::read_to_string(root.join("s1").join("prompt.txt")).unwrap();
+        assert!(sent.contains("Read /p/polish/SKILL.md in full") && sent.contains("arguments \"fix the bug\""), "{sent}");
+        std::fs::remove_file(root.join("s1").join("prompt.txt")).unwrap();
+
+        for c in "/comp".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(!root.join("s1").join("prompt.txt").exists() && app.note.contains("built into Claude Code"), "{}", app.note);
+        assert_eq!(app.input.text(), "/comp", "a built-in stays typed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// p on an agent opens the tree on it with the panel taking keys: text
+    /// (q too) builds the prompt, enter leaves it for its session, a digit
+    /// on an empty prompt answers the session's permission request, esc
+    /// gives the keys back to the tree.
+    #[test]
+    fn p_opens_the_prompt_panel_for_the_agents_session() {
+        let root = std::env::temp_dir().join(format!("office-panel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut app = App::new(0, 1);
+        (app.bridge, app.hooks) = (root.clone(), true);
+        app.set_snapshot(busy_snap());
+        app.focus = "a1".into();
+        assert_eq!(press(&mut app, KeyCode::Char('p')), Action::Switched);
+        assert_eq!((app.view, app.typing, app.selected.as_str()), (View::Tree, true, "a1"));
+        assert_eq!(app.panel_session().map(|a| a.id.as_str()), Some("s1"), "a subagent's panel talks to its session");
+        for c in "quit now".chars() {
+            assert_eq!(press(&mut app, KeyCode::Char(c)), Action::None);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(std::fs::read_to_string(root.join("s1").join("prompt.txt")).unwrap().ends_with("next message:\n\nquit now"));
+        assert!(app.input.is_empty() && app.note.starts_with("queued"), "{}", app.note);
+
+        // A permission request filed by the hook; 2 is "yes, don't ask again".
+        std::fs::write(root.join("s1").join("ask-42.json"), r#"{"summary":"Bash: rm -rf build"}"#).unwrap();
+        app.poll_bridge();
+        assert_eq!(app.ask.as_ref().map(|a| a.summary.as_str()), Some("Bash: rm -rf build"));
+        let text = app.panel_lines(60, 20).iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("asks: Bash: rm -rf build") && text.contains("1 yes · 2 yes, don't ask again · 3 no"), "{text}");
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(std::fs::read_to_string(root.join("s1").join("answer-42.json")).unwrap(), "always");
+        assert_eq!(press(&mut app, KeyCode::Esc), Action::None);
+        assert!(!app.typing);
+        assert_eq!(press(&mut app, KeyCode::Char('q')), Action::Quit, "the tree's keys again");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A short pane keeps the card's sections, with fewer lines in each.
     #[test]
     fn card_fits_a_short_pane() {
         let mut s = busy_snap();
         let a1 = s.by_id.get_mut("a1").unwrap();
-        a1.events = (0..20).map(|i| crate::scan::Event { at: i * SEC, kind: "tool_use", tool: "Read".into(), summary: format!("Read: f{i}") }).collect();
+        a1.events = (0..20).map(|i| crate::scan::Event { at: i * SEC, kind: "tool_use", tool: "Read".into(), summary: format!("Read: f{i}"), ..Default::default() }).collect();
         let mut app = App::new(0, 1);
         app.set_snapshot(s);
         app.focus = "a1".into();
@@ -1138,6 +987,6 @@ mod tests {
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.selected, "s2");
         let s = screen(&mut app);
-        assert!(s.contains("▸ ◐ s1 s1 title [work]"), "{s}");
+        assert!(s.contains("▸ ◐ [work](proj) s1 title"), "{s}");
     }
 }

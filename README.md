@@ -246,8 +246,10 @@ All sessions share one office. There are no session keys.
   - The lobby, the washroom and the open plan's aisles are for walking and
     waiting. The copy room has no door on the picture, so nobody goes in.
 - **Residents:** agents of active sessions take work and rest places. A
-  session is active when it has an agent that is running or active, or not done
-  and busy in the last 5 minutes. The most recently active lead gets the
+  session is active when a running Claude Code process holds it (its
+  `sessions/<pid>.json` names it, so a quiet background session counts), or it
+  has an agent that is running or active, or not done and busy in the last 5
+  minutes. The most recently active lead gets the
   manager's desk; other leads and subagents take the desk grid, then the meeting
   room. Running and active agents work, idle ones rest and doze (`z`), done ones
   rest dimmed with a `✓` and walk out after 10 minutes. An agent waiting for
@@ -281,6 +283,7 @@ The office shows no text except the card.
 | `i`                              | open or close the card of the selected agent |
 | `↑`/`↓`, `k`/`j`, `tab`, wheel   | select the previous or next agent |
 | `enter`                          | open the selected agent in the tree view |
+| `p`                              | open the tree on the selected agent, typing in its session's [prompt panel](#prompt-panel) |
 | `v`                              | switch between the office and the tree view |
 | `r`                              | rescan |
 | `q`, `esc`, `ctrl+c`             | quit (`esc` closes an open card first) |
@@ -381,9 +384,90 @@ your settings allow without asking.
 | `enter`, `space`  | collapse or expand a node  |
 | `tab`             | next tab                   |
 | `1` `2` `3`       | Activity, Interactions, Usage |
+| `p`               | type in the prompt panel   |
+| `o`               | resume the selected session in the background, then type in its panel |
 | `v`               | switch to the office view  |
 | `r`               | drop all state and rescan  |
 | `q`, `ctrl+c`     | quit                       |
+
+## Prompt panel
+
+Under the tree sits a panel for the session of the selected row (a subagent's
+row means its session). From it you can answer the session's permission
+request or send it a prompt, in any terminal: office talks to Claude Code
+through Claude Code's own hooks, never by typing into another window.
+
+Install the hooks once, into the `settings.json` of `~/.claude` and every
+`~/.claude-*` (a copy of the old file is kept as `settings.json.bak-office`),
+then restart the sessions you want to reach:
+
+```sh
+office hook install      # office hook uninstall removes them again
+```
+
+Press `p` on an agent in the office, or in the tree. While the panel has the
+keys (orange border), every key is text; `esc` gives them back to the tree.
+
+The panel reads like Claude Code's own: the session's conversation fills it,
+newest at the bottom (your prompts after `>`, its replies after `●`, whole and
+wrapped, its tool calls on one line each, prompts sent from office included),
+and you type in a rounded box under it. What the session waits on sits just
+over the box: a permission request (`asks: Bash: rm -rf build`), a question
+with its numbered options (asked one at a time when there are several), or a
+plan waiting for approval.
+
+| Key              | Action |
+|------------------|--------|
+| text, `enter`    | send the prompt to the session |
+| `/`              | list the session's slash commands as you type; `↑`/`↓` pick, `tab` completes, `enter` runs the picked one |
+| `←` `→`, `home` `end` | move the cursor; `ctrl`/`alt`+`←` `→` by word |
+| `backspace` `delete`, `ctrl+w` `ctrl+u` `ctrl+k` | delete a char, the word before, or to the start or end |
+| `1` `2` `3`      | with an empty prompt: answer the waiting permission request yes · yes, don't ask again · no |
+| `1`…`9`          | with an empty prompt: pick that option of the session's question; or type your own answer and `enter` |
+| `pgup` `pgdn`, mouse wheel | scroll the conversation; sending a prompt goes back to the newest |
+| `↑`/`↓`          | with no command list: move to another row, so another session |
+| `esc`            | back to the tree |
+| `ctrl+c`         | quit |
+
+The panel says whether a Claude Code process holds the session (`running`).
+When none does, `o` in the tree resumes it with `claude --resume <id> --bg`,
+in the session's folder and under its config dir: Claude Code's own
+background session, which needs no terminal. Its waiter starts with it, so
+prompts from the panel reach it; `claude attach <id>` shows it in a terminal,
+`claude stop <id>` ends it. A session already running is not started twice.
+
+A background session cannot ask whether to trust its folder, so Claude Code
+refuses one in a folder that account has not trusted yet (and always in your
+home directory). The panel then says so, with the command that trusts it, and
+`o` again runs `claude --resume <id>` right in office's terminal: answer
+Claude Code's trust prompt there and use the session; office comes back when
+you exit Claude. Once trusted, `o` resumes it in the background. office
+never marks a folder trusted itself.
+
+How it works (files in `$XDG_STATE_HOME/claude-monitor/bridge`, else
+`~/.local/state/claude-monitor/bridge`):
+
+- **Permission requests:** a `PermissionRequest` hook (`office hook permission`)
+  files each request while office runs and waits up to 10 minutes for its
+  answer. Claude Code shows its own dialog all along: answer either place.
+  When office is not running, the hook returns at once and changes nothing.
+  "Yes, don't ask again" adds the rule Claude Code itself suggests.
+- **Headless runs** (`claude -p`, the Agent SDK) are left alone by both hooks:
+  they end on their own, and would wait on a waiter.
+- **Prompts:** `Stop` and `SessionStart` hooks (`office hook wait`) start a
+  background waiter that never blocks the session (`asyncRewake`). A prompt
+  you send wakes an idle session at once. Sent to a busy one, Claude Code hands
+  it over during or after that turn. A session that has not started or ended a
+  turn since the hooks were installed has no waiter yet; the panel says
+  "queued" and it is taken at the end of the session's next turn. The session
+  reads it as a hook message that says it came from claude-monitor, not as
+  text typed into its prompt box.
+- **Slash commands:** that hook message never reaches Claude Code's command
+  parser, so office sends a command as its file instead: a skill's `SKILL.md`
+  or a custom command's `.md`, from the project's `.claude`, the account, or an
+  enabled plugin, for the session to read and follow with your arguments.
+  Built-ins such as `/clear`, `/compact` and `/model` have no file and run only
+  in the session's own terminal; the panel says so and keeps them typed.
 
 ## Data sources
 

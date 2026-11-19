@@ -8,20 +8,20 @@
 //! their marks and links (`paint`), and the pet that strolls round the
 //! lobby (`Pet`, `paint_pet`).
 
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    hash::{DefaultHasher, Hash, Hasher},
-    sync::LazyLock,
-    time::Duration,
-};
+mod graph;
+mod paint;
+mod walk;
 
-use image::RgbaImage;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
-    cast::fnv32a,
     scan::{Agent, EdgeKind, Kind, SEC, Snapshot, Status},
-    scene::{self, CHARACTER_HEIGHT, Layout, Point, Pose, Scaled, WALK_SPEED},
+    scene::{Point, Pose, WALK_SPEED},
 };
+
+pub use graph::GRAPH;
+pub use paint::{Item, PET, link_rgb, paint, paint_pet};
+pub use walk::Walker;
 
 /// How long a done agent stays before it leaves the office.
 pub const LEAVE_AFTER: i64 = 600 * SEC;
@@ -42,191 +42,6 @@ const VISIT_WAIT: (f64, f64) = (1.0, 3.0);
 const PET_WAIT: (f64, f64) = (1.0, 4.0);
 /// How fast the pet strolls: slower than visitors, who so pass it.
 const PET_SPEED: f64 = 0.5 * VISITOR_SPEED;
-
-/// The places and corridors, built once from office.png measurements.
-pub struct Graph {
-    pub nodes: Vec<Point>, // fractions of the office
-    adj: Vec<Vec<usize>>,
-    pub exit: usize,
-    pub lead_desk: usize,
-    pub desks: Vec<usize>,  // the open plan's desks, row by row
-    pub chairs: Vec<usize>, // the meeting room's: work places once the desks are taken
-    pub seats: Vec<usize>,  // rest seats, in the order they fill: one room after another
-    pub stops: Vec<usize>,  // where visitors may wait: no place, clear of every place
-    pub pet_stops: Vec<usize>, // the lobby's nodes the pet strolls between: not the entrance
-}
-
-/// The picture the measurements were taken on is 1254×1254.
-const SIZE: f64 = 1254.0;
-
-pub static GRAPH: LazyLock<Graph> = LazyLock::new(|| {
-    let mut g = Graph { nodes: Vec::new(), adj: Vec::new(), exit: 0, lead_desk: 0, desks: Vec::new(), chairs: Vec::new(), seats: Vec::new(), stops: Vec::new(), pet_stops: Vec::new() };
-    let mut n = |x: f64, y: f64| {
-        g.nodes.push(Point { x: x / SIZE, y: y / SIZE });
-        g.adj.push(Vec::new());
-        g.nodes.len() - 1
-    };
-    // Lobby: the glass doors at the top, around the reception desk.
-    let exit = n(630.0, 118.0);
-    let (lob_n, lob_nw, lob_ne) = (n(630.0, 190.0), n(455.0, 190.0), n(805.0, 190.0));
-    let (lob_sw, lob_s, lob_se) = (n(455.0, 420.0), n(630.0, 420.0), n(805.0, 420.0));
-    // Top-left lounge, through its door on the lobby's west wall; a stop in
-    // front of the coffee table.
-    let (tl_out, tl_in, tl_s) = (n(425.0, 330.0), n(318.0, 305.0), n(205.0, 315.0));
-    let (tl_gap_s, tl_gap_n, tl_sw) = (n(257.0, 292.0), n(257.0, 210.0), n(150.0, 300.0));
-    let (tl_sofa, tl_arm_l, tl_arm_r) = (n(203.0, 198.0), n(119.0, 266.0), n(290.0, 250.0));
-    // Washroom, through its door on the lobby's west strip, to the sinks.
-    let (wc_out, wc_in, wc_n, wc_w) = (n(310.0, 500.0), n(228.0, 500.0), n(228.0, 425.0), n(110.0, 425.0));
-    // Meeting room, through its door on the lobby's east wall: an aisle
-    // round the table, and seven of its chairs (the rest stand too close).
-    let (mt_out, mt_in, mt_w) = (n(805.0, 390.0), n(915.0, 390.0), n(915.0, 268.0));
-    let (mt_nw, mt_n1, mt_n2) = (n(915.0, 125.0), n(992.0, 125.0), n(1093.0, 125.0));
-    let (mt_sw, mt_s, mt_se, mt_e2, mt_e1) = (n(915.0, 475.0), n(1023.0, 478.0), n(1182.0, 475.0), n(1182.0, 368.0), n(1182.0, 268.0));
-    let chairs = vec![n(992.0, 172.0), n(1093.0, 172.0), n(955.0, 268.0), n(1132.0, 268.0), n(955.0, 368.0), n(1132.0, 368.0), n(1023.0, 458.0)];
-    // The copy room has no door on the picture: nobody goes in.
-    // Open plan: past either end of the planter shelf, then a grid of aisles.
-    let (op_nw, op_ne) = (n(345.0, 470.0), n(835.0, 470.0));
-    let (xs, ys) = ([340.0, 505.0, 650.0, 822.0], [565.0, 742.0, 905.0, 1100.0]);
-    let grid: Vec<Vec<usize>> = xs.iter().map(|&x| ys.iter().map(|&y| n(x, y)).collect()).collect();
-    // Desks: the chair of each, reached from the aisle above its row.
-    let (cols, rows) = ([430.0, 575.0, 720.0], [642.0, 806.0, 977.0]);
-    let mut desks = Vec::new();
-    let mut desk_entries = Vec::new();
-    for (r, &y) in rows.iter().enumerate() {
-        for (c, &x) in cols.iter().enumerate() {
-            desk_entries.push((n(x, ys[r]), c, r));
-            desks.push(n(x, y));
-        }
-    }
-    // The manager's office, through its door on the open plan's east wall.
-    let (mgr_out, mgr_in, mgr_w, mgr_nw) = (n(845.0, 812.0), n(945.0, 800.0), n(962.0, 735.0), n(962.0, 628.0));
-    let (lead_desk, mgr_sofa) = (n(1048.0, 640.0), n(990.0, 815.0));
-    // Bottom-right lounge, through its door on the open plan's east wall.
-    let (br_out, br_in, br_w, br_n, br_s) = (n(850.0, 1120.0), n(975.0, 1112.0), n(975.0, 1000.0), n(1060.0, 1000.0), n(1060.0, 1150.0));
-    let (br_tr, br_bl, br_br) = (n(1105.0, 1042.0), n(1015.0, 1132.0), n(1108.0, 1134.0));
-    // Kitchen and dining room, through the door on the open plan's west wall.
-    let (kit_in, kit_e, kit_se, kit_mid) = (n(265.0, 745.0), n(265.0, 850.0), n(268.0, 978.0), n(180.0, 985.0));
-    let (kit_nw, kit_sw, kit_s) = (n(70.0, 985.0), n(70.0, 1150.0), n(200.0, 1155.0));
-    let (stool_l, stool_r) = (n(120.0, 945.0), n(217.0, 945.0));
-    let (din_tl, din_tr, din_bl, din_br) = (n(155.0, 1037.0), n(245.0, 1037.0), n(155.0, 1137.0), n(245.0, 1137.0));
-
-    let mut e = |a: usize, b: usize| {
-        g.adj[a].push(b);
-        g.adj[b].push(a);
-    };
-    for (a, b) in [(exit, lob_n), (lob_n, lob_nw), (lob_n, lob_ne), (lob_nw, lob_sw), (lob_ne, mt_out), (mt_out, lob_se), (lob_sw, lob_s), (lob_s, lob_se)] {
-        e(a, b);
-    }
-    for (a, b) in [(lob_nw, tl_out), (lob_sw, tl_out), (tl_out, tl_in), (tl_in, tl_gap_s), (tl_gap_s, tl_gap_n), (tl_gap_n, tl_sofa)] {
-        e(a, b);
-    }
-    for (a, b) in [(tl_in, tl_s), (tl_s, tl_sw), (tl_sw, tl_arm_l), (tl_in, tl_arm_r)] {
-        e(a, b);
-    }
-    for (a, b) in [(op_nw, wc_out), (wc_out, wc_in), (wc_in, wc_n), (wc_n, wc_w)] {
-        e(a, b);
-    }
-    for (a, b) in [(mt_out, mt_in), (mt_in, mt_w), (mt_w, mt_nw), (mt_nw, mt_n1), (mt_n1, mt_n2), (mt_in, mt_sw), (mt_sw, mt_s), (mt_s, mt_se), (mt_se, mt_e2), (mt_e2, mt_e1)] {
-        e(a, b);
-    }
-    for (a, b) in [mt_n1, mt_n2, mt_w, mt_e1, mt_in, mt_e2, mt_s].into_iter().zip(chairs.iter().copied()) {
-        e(a, b);
-    }
-    for (a, b) in [(lob_sw, op_nw), (lob_se, op_ne), (op_nw, grid[0][0]), (op_ne, grid[3][0])] {
-        e(a, b);
-    }
-    for c in 0..xs.len() {
-        for r in 0..ys.len() {
-            if c + 1 < xs.len() {
-                e(grid[c][r], grid[c + 1][r]);
-            }
-            if r + 1 < ys.len() {
-                e(grid[c][r], grid[c][r + 1]);
-            }
-        }
-    }
-    for (i, &(entry, c, r)) in desk_entries.iter().enumerate() {
-        e(entry, grid[c][r]);
-        e(entry, grid[c + 1][r]);
-        e(entry, desks[i]);
-    }
-    for (a, b) in [(grid[3][1], mgr_out), (grid[3][2], mgr_out), (mgr_out, mgr_in), (mgr_in, mgr_w), (mgr_w, mgr_nw), (mgr_nw, lead_desk), (mgr_in, mgr_sofa)] {
-        e(a, b);
-    }
-    for (a, b) in [(grid[3][3], br_out), (br_out, br_in), (br_in, br_w), (br_w, br_n), (br_n, br_tr), (br_in, br_bl), (br_in, br_s), (br_s, br_br)] {
-        e(a, b);
-    }
-    for (a, b) in [(grid[0][1], kit_in), (kit_in, kit_e), (kit_e, kit_se), (kit_se, kit_mid), (kit_mid, kit_nw), (kit_nw, kit_sw), (kit_sw, kit_s)] {
-        e(a, b);
-    }
-    for (a, b) in [(kit_mid, stool_l), (kit_mid, stool_r), (kit_mid, din_tl), (kit_mid, din_tr), (kit_s, din_bl), (kit_s, din_br)] {
-        e(a, b);
-    }
-    g.exit = exit;
-    g.lead_desk = lead_desk;
-    g.desks = desks;
-    g.chairs = chairs;
-    // A seat in each rest room in turn, so idle agents spread over them.
-    let rest = [vec![tl_sofa, tl_arm_l, tl_arm_r], vec![stool_l, din_tr, stool_r, din_bl, din_tl, din_br], vec![br_tr, br_bl, br_br], vec![mgr_sofa]];
-    g.seats = (0..6).flat_map(|i| rest.iter().filter_map(move |r| r.get(i).copied())).collect();
-    // Round the reception desk and to the lounge's and meeting room's doors:
-    // the shortest way between any two of them stays in the lobby.
-    g.pet_stops = vec![lob_n, lob_nw, lob_ne, lob_sw, lob_s, lob_se, tl_out, mt_out];
-    let places: Vec<usize> = g.places().collect();
-    g.stops = (0..g.nodes.len()).filter(|&n| n != exit && places.iter().all(|&p| p != n && apart(g.nodes[n], g.nodes[p]))).collect();
-    g
-});
-
-/// Whether characters standing at p and q are clear of each other: side by
-/// side CHARACTER_HEIGHT·MAX_ASPECT apart, or above each other a character
-/// height apart.
-fn apart(p: Point, q: Point) -> bool {
-    (p.x - q.x).abs() >= CHARACTER_HEIGHT * scene::MAX_ASPECT || (p.y - q.y).abs() >= CHARACTER_HEIGHT
-}
-
-impl Graph {
-    /// Every place an agent can take: the manager's desk, the desks, the chairs, the seats.
-    fn places(&self) -> impl Iterator<Item = usize> + '_ {
-        [self.lead_desk].into_iter().chain(self.desks.iter().copied()).chain(self.chairs.iter().copied()).chain(self.seats.iter().copied())
-    }
-
-    fn dist(&self, a: usize, b: usize) -> f64 {
-        let (p, q) = (self.nodes[a], self.nodes[b]);
-        (p.x - q.x).hypot(p.y - q.y)
-    }
-
-    /// The shortest path from a to b along corridors, both included, and its length.
-    fn path(&self, a: usize, b: usize) -> (Vec<usize>, f64) {
-        let mut best = vec![f64::INFINITY; self.nodes.len()];
-        let mut prev = vec![usize::MAX; self.nodes.len()];
-        let mut done = vec![false; self.nodes.len()];
-        best[a] = 0.0;
-        while let Some(u) = (0..self.nodes.len()).filter(|&i| !done[i] && best[i].is_finite()).min_by(|&i, &j| best[i].total_cmp(&best[j])) {
-            done[u] = true;
-            if u == b {
-                break;
-            }
-            for &v in &self.adj[u] {
-                let d = best[u] + self.dist(u, v);
-                if d < best[v] {
-                    best[v] = d;
-                    prev[v] = u;
-                }
-            }
-        }
-        let mut path = vec![b];
-        let mut cur = b;
-        while cur != a {
-            cur = prev[cur];
-            if cur == usize::MAX {
-                return (vec![a], f64::INFINITY);
-            }
-            path.push(cur);
-        }
-        path.reverse();
-        (path, best[b])
-    }
-}
 
 /// What a character is doing, which picks its motion and marks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -278,11 +93,12 @@ fn at_desk(s: Status) -> bool {
     matches!(s, Status::Running | Status::Waiting | Status::Active)
 }
 
-/// Whether the session root is active at now: one of its agents is running
-/// or active, or is not done and was active within ACTIVE_WINDOW.
+/// Whether the session root is active at now: a running Claude Code process
+/// holds it (a background one may write nothing for hours), or one of its
+/// agents is running or active, or is not done and was active within ACTIVE_WINDOW.
 pub fn session_active(snap: &Snapshot, root: &str, now: i64) -> bool {
     let mut on = false;
-    snap.walk(root, 0, &mut |a, _| on |= at_desk(a.status) || (a.status != Status::Done && now - a.last_activity <= ACTIVE_WINDOW));
+    snap.walk(root, 0, &mut |a, _| on |= a.live || at_desk(a.status) || (a.status != Status::Done && now - a.last_activity <= ACTIVE_WINDOW));
     on
 }
 
@@ -367,436 +183,13 @@ pub fn layout(snap: &Snapshot, now: i64, was: &Scene) -> Scene {
     sc
 }
 
-/// An actor on its way: where it is, the corridor nodes ahead of it (the
-/// last is where it heads), and the node it came from.
-#[derive(Clone, Debug)]
-struct Mover {
-    pos: Point,
-    from: usize,
-    path: VecDeque<usize>,
-    left: bool,
-    actor: Actor, // as last drawn
-    gone: bool,   // left the scene, walking out
-}
-
-impl Mover {
-    fn dest(&self) -> usize {
-        self.path.back().copied().unwrap_or(self.from)
-    }
-
-    /// Heads for dest from where it is: on to the next node or back to the
-    /// last, whichever is shorter, then along the corridors.
-    fn head_for(&mut self, dest: usize) {
-        let g = &*GRAPH;
-        let d = |n: usize| (g.nodes[n].x - self.pos.x).hypot(g.nodes[n].y - self.pos.y);
-        let via = |n: usize| {
-            let (p, len) = g.path(n, dest);
-            (p, len + d(n))
-        };
-        let (back, ahead) = (via(self.from), self.path.front().map(|&n| via(n)));
-        let (p, _) = match ahead {
-            Some(a) if a.1 < back.1 => a,
-            _ => back,
-        };
-        self.path = p.into();
-        if self.path.front() == Some(&self.from) && d(self.from) == 0.0 {
-            self.path.pop_front();
-        }
-    }
-
-    fn advance(&mut self, mut step: f64) {
-        let g = &*GRAPH;
-        while step > 0.0 {
-            let Some(&n) = self.path.front() else { return };
-            let q = g.nodes[n];
-            let (dx, dy) = (q.x - self.pos.x, q.y - self.pos.y);
-            if dx != 0.0 {
-                self.left = dx < 0.0;
-            }
-            let len = dx.hypot(dy);
-            if len <= step {
-                (self.pos, self.from) = (q, n);
-                self.path.pop_front();
-                step -= len;
-            } else {
-                self.pos = Point { x: self.pos.x + dx / len * step, y: self.pos.y + dy / len * step };
-                step = 0.0;
-            }
-        }
-    }
-}
-
-/// A visitor on its round: where it is, and the stops ahead with the seconds
-/// it waits at each; the last stop is the entrance, where it leaves.
-#[derive(Clone, Debug)]
-struct Visit {
-    m: Mover,
-    stops: VecDeque<(usize, f64)>,
-    waited: f64,
-    speed: f64,
-}
-
-impl Visit {
-    /// In at the entrance, round 2 to 4 stops, and back out.
-    fn new(actor: Actor, rng: &mut Rng) -> Visit {
-        let g = &*GRAPH;
-        let mut stops = VecDeque::new();
-        let mut at = g.exit;
-        for _ in 0..2 + rng.below(3) {
-            let next: Vec<usize> = g.stops.iter().copied().filter(|&n| n != at).collect();
-            at = next[rng.below(next.len())];
-            stops.push_back((at, if rng.below(2) == 0 { rng.range(VISIT_WAIT) } else { 0.0 }));
-        }
-        stops.push_back((g.exit, 0.0));
-        let mut m = Mover { pos: g.nodes[g.exit], from: g.exit, path: VecDeque::new(), left: false, actor, gone: false };
-        m.head_for(stops[0].0);
-        Visit { m, stops, waited: 0.0, speed: VISITOR_SPEED }
-    }
-
-    /// Whether it stands at a stop, waiting.
-    fn waiting(&self) -> bool {
-        self.m.path.is_empty() && self.stops.front().is_some_and(|&(_, wait)| wait > 0.0)
-    }
-
-    /// Walks or waits dt seconds of the round; false once out of the door.
-    fn walk(&mut self, dt: f64) -> bool {
-        loop {
-            if !self.m.path.is_empty() {
-                self.m.advance(self.speed * dt);
-                return true;
-            }
-            let Some(&(_, wait)) = self.stops.front() else { return false };
-            if self.waited < wait {
-                self.waited += dt;
-                return true;
-            }
-            self.stops.pop_front();
-            self.waited = 0.0;
-            let Some(&(next, _)) = self.stops.front() else { return false };
-            self.m.head_for(next);
-        }
-    }
-}
-
-/// xorshift64: the visitors' dice, seeded so a run can be replayed.
-#[derive(Clone, Debug)]
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Rng {
-        Rng((seed ^ 0x9e37_79b9_7f4a_7c15) | 1)
-    }
-
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    /// One of 0..n.
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n.max(1) as u64) as usize
-    }
-
-    fn range(&mut self, (lo, hi): (f64, f64)) -> f64 {
-        lo + (hi - lo) * (self.next() >> 11) as f64 / (1u64 << 53) as f64
-    }
-}
-
-/// The office pet: a visitor that never leaves the lobby. It walks from one
-/// of GRAPH.pet_stops to another, waiting PET_WAIT at each, for good: its
-/// round is topped up whenever it runs short.
-#[derive(Clone, Debug)]
-struct Pet {
-    v: Visit,
-    rng: Rng,
-}
-
-impl Pet {
-    /// Waiting at one of its stops, picked by seed.
-    fn new(seed: u64) -> Pet {
-        let g = &*GRAPH;
-        let mut rng = Rng::new(seed);
-        let at = g.pet_stops[rng.below(g.pet_stops.len())];
-        let pos = g.nodes[at];
-        let actor = Actor { id: PET.into(), kind: "pet".into(), status: Status::Idle, node: at, pos, anim: Anim::Idle, left: false, selected: false, lead: false, sprite: 0, visitor: false };
-        let m = Mover { pos, from: at, path: VecDeque::new(), left: false, actor, gone: false };
-        let stops = VecDeque::from([(at, rng.range(PET_WAIT))]);
-        Pet { v: Visit { m, stops, waited: 0.0, speed: PET_SPEED }, rng }
-    }
-
-    /// Walks or waits dt seconds; where it stands then. Waiting where one of
-    /// `others` stands, it walks on instead.
-    fn walk(&mut self, dt: f64, mut others: impl Iterator<Item = Point>) -> Pose {
-        let g = &*GRAPH;
-        if let (true, Some(&(_, wait))) = (self.v.m.path.is_empty(), self.v.stops.front())
-            && others.any(|p| !apart(p, self.v.m.pos))
-        {
-            self.v.waited = self.v.waited.max(wait);
-        }
-        while self.v.stops.len() < 2 {
-            let last = self.v.stops.back().map_or(self.v.m.from, |&(n, _)| n);
-            let next: Vec<usize> = g.pet_stops.iter().copied().filter(|&n| n != last).collect();
-            let stop = (next[self.rng.below(next.len())], self.rng.range(PET_WAIT));
-            self.v.stops.push_back(stop);
-        }
-        self.v.walk(dt);
-        Pose { p: self.v.m.pos, left: self.v.m.left, moving: !self.v.m.path.is_empty() }
-    }
-}
-
-/// Carries actors between the places successive layouts give them: an actor
-/// whose place changed walks there along the corridors; a newcomer walks in
-/// from the entrance; one that vanished walks out to it. Every VISIT_EVERY
-/// seconds, while fewer than MAX_VISITORS are in, a guest of the scene comes
-/// in for a round: the one with the fewest visits so far (residents with no
-/// place before the rest), first in line among equals. The pet strolls on
-/// all the while.
-pub struct Walker {
-    movers: HashMap<String, Mover>,
-    visits: Vec<Visit>,
-    seen: HashMap<String, u32>, // visits so far, by agent
-    next: Option<f64>,          // when the next visitor may come in
-    rng: Rng,
-    pet: Pet, // its own dice, so the visitors' are as they were
-    last: Option<f64>,
-    primed: bool,
-}
-
-impl Walker {
-    pub fn new(seed: u64) -> Walker {
-        let pet = Pet::new(seed.rotate_left(32));
-        Walker { movers: HashMap::new(), visits: Vec::new(), seen: HashMap::new(), next: None, rng: Rng::new(seed), pet, last: None, primed: false }
-    }
-
-    /// Forgets every resident, so the next step places them without walking.
-    pub fn reset(&mut self) {
-        (self.movers, self.last, self.primed) = (HashMap::new(), None, false);
-    }
-
-    /// Advances the walk to sec (seconds on any steady clock) and rewrites
-    /// sc: actors on their way are drawn where they are, walking, the
-    /// visitors join the actors and the roster, and the pet is where it is.
-    pub fn step(&mut self, sc: &mut Scene, sec: f64) {
-        let g = &*GRAPH;
-        let dt = self.last.map_or(0.0, |l| (sec - l).clamp(0.0, 0.25));
-        self.last = Some(sec);
-        let step = WALK_SPEED * dt;
-        let mut here = HashSet::new();
-        for a in &mut sc.actors {
-            here.insert(a.id.clone());
-            // A visitor who became a resident walks on from where it is.
-            if let Some(i) = self.visits.iter().position(|v| v.m.actor.id == a.id) {
-                self.movers.insert(a.id.clone(), self.visits.remove(i).m);
-            }
-            let primed = self.primed;
-            let m = self.movers.entry(a.id.clone()).or_insert_with(|| {
-                let start = if primed { g.exit } else { a.node };
-                Mover { pos: g.nodes[start], from: start, path: VecDeque::new(), left: false, actor: a.clone(), gone: false }
-            });
-            if m.gone || m.dest() != a.node {
-                m.gone = false;
-                m.head_for(a.node);
-            }
-            m.advance(step);
-            if !m.path.is_empty() {
-                (a.pos, a.anim, a.left) = (m.pos, Anim::Walk, m.left);
-            }
-            m.actor = a.clone();
-        }
-        let mut ghosts = Vec::new();
-        self.movers.retain(|id, m| {
-            if here.contains(id) {
-                return true;
-            }
-            if !m.gone {
-                m.gone = true;
-                m.head_for(g.exit);
-            }
-            m.advance(step);
-            if m.path.is_empty() {
-                return false; // out of the door
-            }
-            ghosts.push(Actor { pos: m.pos, anim: Anim::Walk, left: m.left, selected: false, ..m.actor.clone() });
-            true
-        });
-        ghosts.sort_by(|a, b| a.id.cmp(&b.id));
-        sc.actors.extend(ghosts);
-
-        self.visits.retain_mut(|v| v.walk(dt));
-        let due = *self.next.get_or_insert(sec + self.rng.range(VISIT_EVERY));
-        if sec >= due {
-            self.next = Some(sec + self.rng.range(VISIT_EVERY));
-            let busy = |id: &str| self.movers.contains_key(id) || self.visits.iter().any(|v| v.m.actor.id == id);
-            let free = sc.guests.iter().enumerate().filter(|(_, a)| !busy(&a.id));
-            let pick = free.min_by_key(|&(i, a)| (i >= sc.overflow, self.seen.get(&a.id).copied().unwrap_or(0), i));
-            if let (true, Some((_, a))) = (self.visits.len() < MAX_VISITORS, pick) {
-                *self.seen.entry(a.id.clone()).or_default() += 1;
-                self.visits.push(Visit::new(a.clone(), &mut self.rng));
-            }
-        }
-        for v in &self.visits {
-            let anim = if v.waiting() { Anim::Idle } else { Anim::Walk };
-            sc.roster.push(v.m.actor.id.clone());
-            sc.actors.push(Actor { pos: v.m.pos, left: v.m.left, anim, ..v.m.actor.clone() });
-        }
-        sc.pet = Some(self.pet.walk(dt, sc.actors.iter().map(|a| a.pos)));
-        self.primed = true;
-    }
-}
-
-/// The colors of the edge kinds: yellow spawn, cyan message, green handback.
-pub fn link_rgb(k: EdgeKind) -> [u8; 3] {
-    match k {
-        EdgeKind::Spawn => [0xf5, 0xd4, 0x42],
-        EdgeKind::Message => [0x4f, 0xdc, 0xec],
-        EdgeKind::Handback => [0x5f, 0xe0, 0x7a],
-    }
-}
-
-const CHECK: [&str; 6] = ["......#", ".....##", "#...##.", "##.##..", ".###...", "..#...."];
-const QUESTION: [&str; 7] = [".###.", "#...#", "....#", "...#.", "..#..", ".....", "..#.."];
-const ZED: [&str; 5] = ["#####", "...#.", "..#..", ".#...", "#####"];
-const ARROW: [&str; 4] = ["#######", ".#####.", "..###..", "...#..."];
-const BUBBLE: [&str; 6] = [".#########.", "#.........#", "#.1..2..3.#", "#.........#", ".####.####.", ".....##...."];
-const LETTER: [&str; 6] = ["#########", "##.....##", "#.#...#.#", "#..#.#..#", "#...#...#", "#########"];
-
-/// Something drawn on the picture, by what it looks like this frame, and the
-/// canvas pixels it covers. Two frames' items with equal keys look the same.
-pub struct Item {
-    pub key: u64,
-    pub rects: Vec<[u32; 4]>,
-}
-
-/// The pet's item key: no agent id or link looks like it.
-pub const PET: &str = "pet:";
-
-/// Draws frame i of the pet (pet: its sprite at its size on l) at ps, sec
-/// into its walk. Its key changes only with the frame and where it is drawn.
-pub fn paint_pet(canvas: &mut RgbaImage, l: &Layout, office: (u32, u32), pet: &Scaled, i: usize, ps: Pose, sec: f64) -> Item {
-    let i = i.min(pet.frames.len() - 1);
-    let rect = scene::draw_character(canvas, l, office, &pet.frames[i], ps, sec);
-    let mut h = DefaultHasher::new();
-    (rect, i).hash(&mut h);
-    Item { key: h.finish(), rects: vec![rect] }
-}
-
-/// Draws the actors and links of sc onto canvas (the office base) at t,
-/// returning one item per actor (keyed by its id) and two per link: its
-/// dotted line, which stays still while its ends do, and the letter
-/// travelling along it. `scaled` holds each sprite at this layout's size.
-pub fn paint(canvas: &mut RgbaImage, l: &Layout, office: (u32, u32), sc: &Scene, scaled: &[Scaled], t: Duration, frames_of: impl Fn(usize, Duration) -> usize) -> HashMap<String, Item> {
-    let mut items = HashMap::new();
-    let ms = t.as_millis() as u64;
-    let sec = t.as_secs_f64();
-    let unit = l.unit();
-    let ch = f64::from(l.character_height());
-    // Characters a few pixels tall (half blocks) get one-pixel marks.
-    let tiny = ch < 16.0;
-    let mut order: Vec<&Actor> = sc.actors.iter().collect();
-    order.sort_by(|a, b| a.pos.y.total_cmp(&b.pos.y));
-    let mut heads = HashMap::new();
-    let mut marks = Vec::new();
-    for a in order {
-        let sprite = &scaled[a.sprite.min(scaled.len() - 1)];
-        let phase = Duration::from_millis(u64::from(fnv32a(&a.id) % 997));
-        let (frame, lift) = match a.anim {
-            Anim::Walk => (frames_of(a.sprite, t + phase), 0.0),
-            Anim::Typing => (frames_of(a.sprite, t + phase), if (ms + phase.as_millis() as u64) / 180 % 2 == 1 { 0.04 } else { 0.0 }),
-            Anim::Idle if a.status != Status::Done => (frames_of(a.sprite, t + phase), 0.0),
-            Anim::Idle | Anim::Sleep => (0, 0.0),
-        };
-        let dim = a.status == Status::Done && a.anim != Anim::Walk && !a.visitor;
-        let img = if dim { &sprite.dimmed } else { &sprite.frames[frame.min(sprite.frames.len() - 1)] };
-        let mut p = a.pos;
-        p.y -= lift * CHARACTER_HEIGHT;
-        let ps = Pose { p, left: a.left, moving: a.anim == Anim::Walk };
-        let rect = scene::draw_character(canvas, l, office, img, ps, sec);
-        let bob = if ps.moving { (scene::walk_bob(sec) * f64::from(img.height())).round() as i64 } else { 0 };
-        let (fx, fy) = l.px(p);
-        let top = fy - f64::from(img.height()) - bob as f64;
-        // Links end above the head where it stands, not where it bobs.
-        let (hx, hy) = l.px(a.pos);
-        heads.insert(a.id.as_str(), (hx, hy - ch));
-        let mut h = DefaultHasher::new();
-        (rect, frame, a.left, dim, bob, a.selected).hash(&mut h);
-        marks.push((a, fx, top, h, rect));
-    }
-    for k in &sc.links {
-        let (Some(&a), Some(&b)) = (heads.get(k.from.as_str()), heads.get(k.to.as_str())) else { continue };
-        let rgb = link_rgb(k.kind);
-        let id = format!("{}>{}>{}", k.from, k.to, k.kind.name());
-        let rects = scene::dotted_line(canvas, a, b, unit.div_ceil(2), rgb, (20 * unit).max(16));
-        let mut h = DefaultHasher::new();
-        ((a.0 as i64, a.1 as i64, b.0 as i64, b.1 as i64), k.kind).hash(&mut h);
-        items.insert(id.clone(), Item { key: h.finish(), rects });
-        // A letter travels from sender to receiver every 1.6 s: its own
-        // item, so only its cells are painted again as it moves; they hold
-        // the line under it, drawn before it.
-        let f = (ms % 1600) as f64 / 1600.0;
-        let f = (f * 16.0).floor() / 16.0;
-        let (x, y) = (a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f);
-        let u = i64::from(unit);
-        let at = ((x - 4.5 * u as f64) as i64, (y - 3.0 * u as f64) as i64);
-        let letter: &[&str] = if tiny { &["#"] } else { &LETTER };
-        let rect = scene::draw_art(canvas, letter, at.0, at.1, unit, |c| match c {
-            '#' => Some(rgb),
-            _ => Some([0xf4, 0xf1, 0xe8]),
-        });
-        let mut h = DefaultHasher::new();
-        (rect, k.kind).hash(&mut h);
-        items.insert(id + ">letter", Item { key: h.finish(), rects: vec![rect] });
-    }
-    for (a, fx, top, mut h, rect) in marks {
-        let u = i64::from(unit);
-        let mut rects = vec![rect];
-        // A mark above the head, dx right of it and dy below its usual
-        // place; a single `dot` pixel when characters are tiny.
-        let mut mark = |art: &[&str], dx: i64, dy: i64, dot: [u8; 3], color: &dyn Fn(char) -> Option<[u8; 3]>| {
-            rects.push(if tiny {
-                let y = top as i64 - 1 - i64::from(dy < -2 * u);
-                scene::draw_art(canvas, &["#"], fx as i64 + dx.signum(), y, 1, |_| Some(dot))
-            } else {
-                let w = art[0].len() as i64 * u;
-                scene::draw_art(canvas, art, fx as i64 - w / 2 + dx, top as i64 - art.len() as i64 * u + dy, unit, color)
-            });
-        };
-        let (dark, white) = ([0x2a, 0x2a, 0x33], [0xff, 0xff, 0xff]);
-        let (blue, green, yellow, orange) = ([0xa8, 0xd8, 0xff], [0x5f, 0xe0, 0x7a], [0xff, 0xd8, 0x3a], [0xff, 0x8c, 0x1a]);
-        match a.anim {
-            Anim::Typing => {
-                let dots = (ms / 300 % 4) as u32;
-                dots.hash(&mut h);
-                mark(&BUBBLE, (ch * 0.35) as i64, -u, white, &|c| match c {
-                    '#' => Some(dark),
-                    '1'..='3' if c.to_digit(10).unwrap_or(9) <= dots => Some(dark),
-                    _ => Some(white),
-                });
-            }
-            Anim::Sleep => {
-                let rise = (ms / 400 % 6) as i64;
-                rise.hash(&mut h);
-                mark(&ZED, (ch * 0.3) as i64, -rise * u, blue, &|c| (c == '#').then_some(blue));
-            }
-            // Waiting for the user, walking to its desk or there.
-            _ if a.status == Status::Waiting => mark(&QUESTION, 0, -u, orange, &|c| (c == '#').then_some(orange)),
-            _ if a.status == Status::Done && a.anim != Anim::Walk && !a.visitor => mark(&CHECK, 0, -u, green, &|c| (c == '#').then_some(green)),
-            _ => {}
-        }
-        if a.selected {
-            let y = if a.anim == Anim::Typing || matches!(a.status, Status::Done | Status::Waiting) { -8 * u } else { -u };
-            mark(&ARROW, 0, y, yellow, &|c| (c == '#').then_some(yellow));
-        }
-        items.insert(a.id.clone(), Item { key: h.finish(), rects });
-    }
-    items
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::graph::{SIZE, apart};
     use crate::scan::{Edge, Usage};
+    use crate::scene;
+    use image::RgbaImage;
 
     const NOW: i64 = 1000 * SEC;
 
@@ -814,11 +207,16 @@ mod tests {
             status,
             last_activity: NOW,
             last_tool: "Bash: ls".into(),
+            last_text: String::new(),
+            config_dir: Default::default(),
+            cwd: String::new(),
+            asking: String::new(),
             turns: 0,
             usage: Usage::default(),
             model_usage: Default::default(),
             events: Vec::new(),
             children: Vec::new(),
+            live: false,
         }
     }
 
@@ -904,11 +302,13 @@ mod tests {
     /// visitors' stops (magenta), the entrance (yellow) and the pet's stops
     /// (orange rings) over office.png, to look at:
     /// OFFICE_GRAPH_PNG=/tmp/g.png cargo test graph_picture -- --ignored
+    /// (OFFICE_GRAPH_BASE=assets/forest.png draws it over another picture)
     #[test]
     #[ignore]
     fn graph_picture() {
         let out = std::env::var("OFFICE_GRAPH_PNG").expect("OFFICE_GRAPH_PNG names the output");
-        let mut img = image::open(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/office.png")).unwrap().to_rgba8();
+        let base = std::env::var("OFFICE_GRAPH_BASE").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/assets/office.png").into());
+        let mut img = image::open(base).unwrap().to_rgba8();
         let (w, h) = (f64::from(img.width()), f64::from(img.height()));
         let g = &*GRAPH;
         let px = |p: Point| (p.x * w, p.y * h);
@@ -972,6 +372,10 @@ mod tests {
         assert!(!session_active(&snap, "done-sub", NOW), "a done agent does not keep its session active");
         snap.by_id.get_mut("d").unwrap().status = Status::Idle;
         assert!(session_active(&snap, "done-sub", NOW), "an idle one active just now does");
+        snap.by_id.get_mut("past").unwrap().live = true;
+        assert!(session_active(&snap, "past", NOW), "a quiet session a process holds, as a resumed background one");
+        let sc = layout(&snap, NOW, &Scene::default());
+        assert!(sc.actors.iter().any(|a| a.id == "past" && !a.visitor), "it is drawn in the office");
     }
 
     /// The nodes of sc's actors, each once.

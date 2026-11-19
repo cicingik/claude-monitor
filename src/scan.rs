@@ -4,13 +4,17 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs::{self, DirEntry, File, Metadata},
-    io::{BufRead, BufReader, Seek, SeekFrom},
+    fs::{self, DirEntry, Metadata},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde_json::Value;
+mod text;
+mod transcript;
+
+pub(crate) use text::tool_summary;
+pub use text::{days_from_civil, parse_rfc3339, truncate};
+use transcript::{FileState, Meta, build, project_name, read_meta};
 
 /// Nanoseconds in a second. Times are i64 Unix nanoseconds; 0 is "never",
 /// like Go's zero time.
@@ -24,16 +28,20 @@ const ACTIVE_WINDOW: i64 = 30 * SEC;
 /// and for at most WAIT_WINDOW (past that the session was likely closed).
 const WAIT_QUIET: i64 = 3 * SEC;
 const WAIT_WINDOW: i64 = 3600 * SEC;
+/// The longest reply or question kept whole.
+const MAX_TEXT: usize = 4000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Kind {
+    #[default]
     Session,
     Subagent,
 }
 
 /// The liveness of an agent, from its transcript and file mtime.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Status {
+    #[default]
     Idle,    // nothing written for 30s or more
     Active,  // transcript written less than 30s ago
     Running, // last tool_use has no tool_result yet and file written less than 2m ago
@@ -87,13 +95,15 @@ impl Usage {
     }
 }
 
-/// One entry of an agent's recent activity. The summary is always short.
-#[derive(Clone, Debug, PartialEq)]
+/// One entry of an agent's recent activity. The summary is always short;
+/// a prompt or a reply also keeps its whole text, for the prompt panel.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Event {
     pub at: i64,
     pub kind: &'static str, // tool_use | text | prompt | handback
     pub tool: String,
     pub summary: String,
+    pub text: String, // a prompt's or reply's whole text, at most MAX_TEXT chars; empty for the others
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -124,7 +134,7 @@ pub struct Edge {
 }
 
 /// A session or subagent as of one scan.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Agent {
     pub id: String,
     pub parent_id: String,
@@ -134,15 +144,20 @@ pub struct Agent {
     pub project: String,
     pub session_id: String, // the root session (equals id for sessions)
     pub config: String,     // which config dir: "claude", "personal", "work", ...
+    pub config_dir: PathBuf, // that config dir itself (~/.claude-work), to resume the session in
+    pub cwd: String,         // the session's working directory
     pub kind: Kind,
     pub status: Status,
     pub last_activity: i64,
     pub last_tool: String, // summary of the most recent tool_use
+    pub last_text: String, // its most recent reply text, whole (at most MAX_TEXT chars)
+    pub asking: String,    // what its unanswered call asks the user: questions and options, or a plan
     pub turns: usize,      // distinct message.id
     pub usage: Usage,      // this agent's own usage, not its children's
     pub model_usage: BTreeMap<String, Usage>,
     pub events: Vec<Event>,    // newest last, at most MAX_EVENTS
     pub children: Vec<String>, // ids, oldest first
+    pub live: bool,            // a session a running Claude Code process holds, though its transcript may be quiet
 }
 
 /// The view built by one scan.
@@ -219,53 +234,6 @@ pub fn dedup_roots(dirs: Vec<PathBuf>) -> Vec<Root> {
     dirs.into_iter().filter(|d| seen.insert(fs::canonicalize(d).unwrap_or_else(|_| d.clone()))).map(Root::new).collect()
 }
 
-/// The subset of agent-<id>.meta.json the monitor uses.
-#[derive(Clone, Debug, Default)]
-struct Meta {
-    agent_type: String,
-    description: String,
-    tool_use_id: String,
-    finished: bool,
-}
-
-/// An Agent/Task tool_use seen in a transcript.
-#[derive(Clone, Debug, Default)]
-struct Spawn {
-    at: i64,
-    description: String,
-    name: String, // optional input.name, resolves SendMessage targets
-}
-
-/// A SendMessage tool_use, or a handback notice (`to` is then the sender).
-#[derive(Clone, Debug)]
-struct Sent {
-    at: i64,
-    to: String,
-    label: String,
-}
-
-/// The parsed state of one transcript, advanced incrementally.
-#[derive(Debug, Default)]
-struct FileState {
-    offset: u64, // bytes consumed: always ends just after a '\n'
-    title: String,
-    model: String,
-    cwd: String,
-    first_at: i64,
-    last_at: i64,
-    usage: HashMap<String, Usage>,      // per message.id, so repeated lines count once
-    msg_model: HashMap<String, String>, // message.id -> model
-    events: Vec<Event>,
-    last_tool_id: String,
-    last_tool_name: String,
-    last_tool: String,
-    mode: String, // the last permission-mode entry: "default", "plan", "acceptEdits", "auto", ...
-    resolved: HashSet<String>,     // tool_use ids that have a tool_result
-    spawns: HashMap<String, Spawn>, // tool_use id -> Agent/Task call
-    sends: Vec<Sent>,
-    handbacks: Vec<Sent>,
-}
-
 /// Keeps per-file parse state between scans, so each scan reads only the
 /// lines appended since the last one.
 pub struct Scanner {
@@ -314,7 +282,10 @@ impl Scanner {
     pub fn scan(&mut self, now: i64) -> Snapshot {
         let mut snap = Snapshot { scanned_at: now, ..Snapshot::default() };
         let mut seen = HashSet::new();
+        let mut live: HashMap<PathBuf, HashSet<String>> = HashMap::new();
         for root in self.roots.clone() {
+            let config_dir = root.dir.parent().map(Path::to_path_buf).unwrap_or_default();
+            let held = live.entry(config_dir.clone()).or_insert_with(|| crate::bridge::live_ids(&config_dir)).clone();
             for p in sorted_dir(&root.dir) {
                 if !p.file_type().is_ok_and(|t| t.is_dir()) {
                     continue;
@@ -327,15 +298,19 @@ impl Scanner {
                         continue;
                     }
                     let Ok(md) = e.metadata() else { continue };
-                    if self.since > 0 && now - mtime(&md) > self.since {
+                    let sid = name.trim_end_matches(".jsonl");
+                    if self.since > 0 && now - mtime(&md) > self.since && !held.contains(sid) {
                         continue;
                     }
-                    let sid = name.trim_end_matches(".jsonl");
                     self.session(&mut snap, &mut seen, &root, &proj_dir, &proj_name, sid, &md, now);
                 }
             }
         }
         self.files.retain(|p, _| seen.contains(p));
+        for id in &snap.roots {
+            let a = snap.by_id.get_mut(id).expect("a root is an agent");
+            a.live = live.get(&a.config_dir).is_some_and(|held| held.contains(id.split('@').next().unwrap_or(id)));
+        }
         let by_id = &snap.by_id;
         snap.roots.sort_by(|a, b| by_id[b].last_activity.cmp(&by_id[a].last_activity));
         snap.edges.sort_by_key(|e| e.at);
@@ -421,6 +396,8 @@ impl Scanner {
                 let mut a = build(st(m), key(&m.id), m.mtime, now, m.meta.finished, &root_st.mode);
                 a.session_id = key(sid);
                 a.config = root.label.clone();
+                a.config_dir = root.dir.parent().map(Path::to_path_buf).unwrap_or_default();
+                a.cwd = root_st.cwd.clone();
                 a.project = project.clone();
                 if i == 0 {
                     a.title = truncate(&root_st.title, 60);
@@ -488,438 +465,10 @@ fn cyclic(parent: &[usize], i: usize) -> bool {
     false
 }
 
-fn read_meta(path: &Path) -> Meta {
-    let Ok(b) = fs::read(path) else { return Meta::default() };
-    let Ok(v) = serde_json::from_slice::<Value>(&b) else { return Meta::default() };
-    Meta {
-        agent_type: s(&v, "agentType").into(),
-        description: s(&v, "description").into(),
-        tool_use_id: s(&v, "toolUseId").into(),
-        finished: v.get("finished").and_then(Value::as_bool).unwrap_or(false),
-    }
-}
-
-/// Turns parse state into an agent with status, usage and events.
-/// Whether a call of tool stops for the user in permission mode: a question
-/// or a plan always does; in a mode that asks, every tool that changes
-/// something or reaches out (in acceptEdits, all but file edits). Rules the
-/// user allowed in settings are not known here, so those count as asking.
-fn asks_user(mode: &str, tool: &str) -> bool {
-    const NEVER_ASK: [&str; 9] = ["Read", "Glob", "Grep", "LS", "TodoWrite", "ToolSearch", "Agent", "Task", "SendMessage"];
-    const EDITS: [&str; 4] = ["Edit", "MultiEdit", "Write", "NotebookEdit"];
-    match tool {
-        "AskUserQuestion" | "ExitPlanMode" => true,
-        _ if NEVER_ASK.contains(&tool) => false,
-        _ => match mode {
-            "default" | "plan" => true,
-            "acceptEdits" => !EDITS.contains(&tool),
-            _ => false, // auto, bypassPermissions, dontAsk, or not recorded
-        },
-    }
-}
-
-fn build(st: &FileState, id: String, mtime: i64, now: i64, finished: bool, mode: &str) -> Agent {
-    let mut a = Agent {
-        id,
-        parent_id: String::new(),
-        title: String::new(),
-        agent_type: String::new(),
-        model: st.model.clone(),
-        project: String::new(),
-        session_id: String::new(),
-        config: String::new(),
-        kind: Kind::Session,
-        status: Status::Idle,
-        last_activity: if st.last_at == 0 { mtime } else { st.last_at },
-        last_tool: st.last_tool.clone(),
-        turns: st.usage.len(),
-        usage: Usage::default(),
-        model_usage: BTreeMap::new(),
-        events: st.events.clone(),
-        children: Vec::new(),
-    };
-    for (mid, u) in &st.usage {
-        a.usage = a.usage.add(*u);
-        if *u == Usage::default() {
-            continue; // e.g. <synthetic> messages: no tokens, no model bucket
-        }
-        let m = st.msg_model.get(mid).filter(|m| !m.is_empty()).map_or("unknown", |m| m.as_str());
-        let t = a.model_usage.entry(m.to_string()).or_default();
-        *t = t.add(*u);
-    }
-    let age = now - mtime;
-    a.status = if finished {
-        Status::Done
-    } else if st.pending() && (WAIT_QUIET..WAIT_WINDOW).contains(&age) && asks_user(mode, &st.last_tool_name) {
-        Status::Waiting
-    } else if st.pending() && age < RUNNING_WINDOW {
-        Status::Running
-    } else if age < ACTIVE_WINDOW {
-        Status::Active
-    } else {
-        Status::Idle
-    };
-    a
-}
-
-/// The last segment of the session cwd, or of the encoded dir name.
-fn project_name(cwd: &str, dir: &str) -> String {
-    if !cwd.is_empty() {
-        let t = cwd.trim_end_matches('/');
-        return if t.is_empty() { "/".into() } else { t.rsplit('/').next().unwrap_or(t).into() };
-    }
-    match dir.rfind('-') {
-        Some(i) if i < dir.len() - 1 => dir[i + 1..].into(),
-        _ => dir.into(),
-    }
-}
-
-/// The string at key in v, or "" when it is missing or not a string.
-fn s<'a>(v: &'a Value, key: &str) -> &'a str {
-    v.get(key).and_then(Value::as_str).unwrap_or("")
-}
-
-impl FileState {
-    /// Whether the most recent tool_use still waits for its result.
-    fn pending(&self) -> bool {
-        !self.last_tool_id.is_empty() && !self.resolved.contains(&self.last_tool_id)
-    }
-
-    /// Consumes complete lines from the offset to EOF. A trailing line
-    /// without '\n' is left for the next call.
-    fn read_from(&mut self, path: &Path) -> std::io::Result<()> {
-        let mut f = File::open(path)?;
-        f.seek(SeekFrom::Start(self.offset))?;
-        let mut r = BufReader::with_capacity(256 * 1024, f);
-        let mut line = Vec::new();
-        loop {
-            line.clear();
-            let n = r.read_until(b'\n', &mut line)?;
-            if n == 0 || line.last() != Some(&b'\n') {
-                return Ok(()); // partial or empty tail: not consumed
-            }
-            self.offset += n as u64;
-            self.parse_line(&line);
-        }
-    }
-
-    fn parse_line(&mut self, b: &[u8]) {
-        if !may_be_relevant(b) {
-            return;
-        }
-        let Ok(v) = serde_json::from_slice::<Value>(b) else { return }; // malformed: skip
-        // Go decodes timestamp as time.Time: a bad one fails the whole line.
-        let at = match v.get("timestamp") {
-            None | Some(Value::Null) => 0,
-            Some(Value::String(t)) => match parse_rfc3339(t) {
-                Some(t) => t,
-                None => return,
-            },
-            Some(_) => return,
-        };
-        if self.cwd.is_empty() {
-            self.cwd = s(&v, "cwd").to_string();
-        }
-        match s(&v, "type") {
-            "assistant" => {
-                self.touch(at);
-                self.parse_assistant(&v, at);
-            }
-            "user" => {
-                self.touch(at);
-                self.parse_user(&v, at);
-            }
-            "permission-mode" => self.mode = s(&v, "permissionMode").to_string(),
-            "ai-title" => {
-                let t = s(&v, "aiTitle");
-                if !t.is_empty() {
-                    self.title = t.to_string();
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn touch(&mut self, t: i64) {
-        if t == 0 {
-            return;
-        }
-        if self.first_at == 0 || t < self.first_at {
-            self.first_at = t;
-        }
-        if t > self.last_at {
-            self.last_at = t;
-        }
-    }
-
-    fn parse_assistant(&mut self, v: &Value, at: i64) {
-        let m = v.get("message").unwrap_or(&Value::Null);
-        let (mid, model) = (s(m, "id"), s(m, "model"));
-        let real_model = !model.is_empty() && !model.starts_with('<'); // skip "<synthetic>"
-        if real_model {
-            self.model = model.to_string();
-        }
-        if !mid.is_empty() {
-            let usage = m.get("usage").filter(|u| !u.is_null());
-            if !self.usage.contains_key(mid) || usage.is_some() {
-                let n = |k: &str| usage.and_then(|u| u.get(k)).and_then(Value::as_i64).unwrap_or(0);
-                let u = Usage {
-                    input: n("input_tokens"),
-                    output: n("output_tokens"),
-                    cache_read: n("cache_read_input_tokens"),
-                    cache_write: n("cache_creation_input_tokens"),
-                };
-                self.usage.insert(mid.to_string(), u); // same message.id on several lines: counted once
-            }
-            if real_model {
-                self.msg_model.insert(mid.to_string(), model.to_string());
-            }
-        }
-        for c in m.get("content").and_then(Value::as_array).into_iter().flatten() {
-            match s(c, "type") {
-                "tool_use" => {
-                    let (name, input) = (s(c, "name"), c.get("input").unwrap_or(&Value::Null));
-                    let sum = tool_summary(name, input, 50);
-                    self.last_tool_id = s(c, "id").to_string();
-                    self.last_tool_name = name.to_string();
-                    self.last_tool = tool_summary(name, input, NOW_MAX);
-                    self.add_event(Event { at, kind: "tool_use", tool: name.into(), summary: sum });
-                    self.record_interaction(at, name, s(c, "id"), input);
-                }
-                "text" => {
-                    let t = one_line(s(c, "text"), 60);
-                    if !t.is_empty() {
-                        self.add_event(Event { at, kind: "text", tool: String::new(), summary: t });
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn record_interaction(&mut self, at: i64, name: &str, id: &str, input: &Value) {
-        match name {
-            "Agent" | "Task" => {
-                let sp = Spawn { at, description: s(input, "description").into(), name: s(input, "name").into() };
-                self.spawns.insert(id.to_string(), sp);
-            }
-            "SendMessage" => {
-                let to = s(input, "to");
-                if to.is_empty() {
-                    return;
-                }
-                let mut label = s(input, "summary");
-                if label.is_empty() {
-                    label = s(input, "message"); // only when message is a string
-                }
-                self.sends.push(Sent { at, to: to.into(), label: one_line(label, 40) });
-            }
-            _ => {}
-        }
-    }
-
-    fn parse_user(&mut self, v: &Value, at: i64) {
-        let content = v.get("message").and_then(|m| m.get("content"));
-        let mut texts: Vec<&str> = Vec::new();
-        if let Some(t) = content.and_then(Value::as_str).filter(|t| !t.is_empty()) {
-            texts.push(t);
-        }
-        for it in content.and_then(Value::as_array).into_iter().flatten() {
-            match s(it, "type") {
-                "tool_result" => {
-                    let id = s(it, "tool_use_id");
-                    if !id.is_empty() {
-                        self.resolved.insert(id.to_string());
-                    }
-                }
-                "text" => texts.push(s(it, "text")),
-                _ => {}
-            }
-        }
-        for t in texts {
-            if let Some(from) = agent_message_from(t) {
-                self.handbacks.push(Sent { at, to: from.into(), label: String::new() });
-                self.add_event(Event { at, kind: "handback", tool: String::new(), summary: format!("agent-message from {from}") });
-                continue;
-            }
-            if t.trim().starts_with('<') {
-                continue; // system reminders, command wrappers, notifications
-            }
-            let t = one_line(t, 60);
-            if !t.is_empty() {
-                self.add_event(Event { at, kind: "prompt", tool: String::new(), summary: t });
-            }
-        }
-    }
-
-    fn add_event(&mut self, e: Event) {
-        self.events.push(e);
-        if self.events.len() > MAX_EVENTS {
-            self.events.drain(..self.events.len() - MAX_EVENTS);
-        }
-    }
-}
-
-/// A byte-level filter run before any JSON decoding: false only when no
-/// "type" key in b has an assistant, user or ai-title value.
-fn may_be_relevant(mut b: &[u8]) -> bool {
-    const KEY: &[u8] = b"\"type\"";
-    const TYPES: [&[u8]; 4] = [b"\"assistant\"", b"\"user\"", b"\"ai-title\"", b"\"permission-mode\""];
-    let trim = |b: &[u8]| -> usize { b.iter().take_while(|&&c| c == b' ' || c == b'\t').count() };
-    loop {
-        let Some(i) = b.windows(KEY.len()).position(|w| w == KEY) else { return false };
-        b = &b[i + KEY.len()..];
-        b = &b[trim(b)..];
-        if b.first() != Some(&b':') {
-            continue;
-        }
-        let v = &b[1..];
-        let v = &v[trim(v)..];
-        if TYPES.iter().any(|t| v.starts_with(t)) {
-            return true;
-        }
-    }
-}
-
-/// The sender id of the first `<agent-message from="<id>"` in t.
-fn agent_message_from(t: &str) -> Option<&str> {
-    const OPEN: &str = "<agent-message from=\"";
-    let mut rest = t;
-    while let Some(i) = rest.find(OPEN) {
-        rest = &rest[i + OPEN.len()..];
-        let n = rest.bytes().take_while(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'-').count();
-        if n > 0 && rest.as_bytes().get(n) == Some(&b'"') {
-            return Some(&rest[..n]);
-        }
-    }
-    None
-}
-
-/// How much of the running tool call the card's "now:" may show (3 lines).
-const NOW_MAX: usize = 150;
-
-/// "Tool: arg" from a tool_use input, the arg's lines joined and cut to max.
-fn tool_summary(name: &str, input: &Value, max: usize) -> String {
-    let arg = match name {
-        "Bash" => s(input, "command").to_string(),
-        "Read" | "Write" | "Edit" | "NotebookEdit" => short_path(s(input, "file_path")),
-        "Agent" | "Task" => {
-            let (d, t) = (s(input, "description"), s(input, "subagent_type"));
-            if t.is_empty() { d.to_string() } else { format!("{d} ({t})") }
-        }
-        "SendMessage" => format!("to {}", s(input, "to")),
-        _ => ["description", "file_path", "path", "pattern", "query", "skill", "url", "name"]
-            .iter()
-            .map(|k| s(input, k))
-            .find(|v| !v.is_empty())
-            .unwrap_or("")
-            .to_string(),
-    };
-    let arg = truncate(&arg.split_whitespace().collect::<Vec<_>>().join(" "), max);
-    if arg.is_empty() { name.to_string() } else { format!("{name}: {arg}") }
-}
-
-/// Keeps the last two path segments.
-fn short_path(p: &str) -> String {
-    let parts: Vec<&str> = p.trim_end_matches('/').split('/').collect();
-    if parts.len() <= 3 {
-        return p.to_string();
-    }
-    format!("…/{}", parts[parts.len() - 2..].join("/"))
-}
-
-/// The first non-empty line of s, trimmed and cut to max characters.
-pub fn one_line(s: &str, max: usize) -> String {
-    s.split('\n').map(str::trim).find(|l| !l.is_empty()).map_or_else(String::new, |l| truncate(l, max))
-}
-
-/// Cuts s to at most max characters, marking the cut with "…".
-pub fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    if max <= 1 {
-        return s.chars().take(max).collect();
-    }
-    s.chars().take(max - 1).chain(['…']).collect()
-}
-
-/// Days since 1970-01-01 of a proleptic Gregorian date.
-pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-/// Unix nanoseconds of an RFC 3339 time such as 2026-01-05T10:20:30.123Z.
-pub fn parse_rfc3339(t: &str) -> Option<i64> {
-    let b = t.as_bytes();
-    let num = |r: std::ops::Range<usize>| -> Option<i64> {
-        let d = b.get(r)?;
-        d.iter().all(u8::is_ascii_digit).then(|| d.iter().fold(0, |n, c| n * 10 + i64::from(c - b'0')))
-    };
-    let sep = |i: usize, c: u8| b.get(i) == Some(&c);
-    if !(sep(4, b'-') && sep(7, b'-') && sep(10, b'T') && sep(13, b':') && sep(16, b':')) {
-        return None;
-    }
-    let (y, mo, d, h, mi, sec) = (num(0..4)?, num(5..7)?, num(8..10)?, num(11..13)?, num(14..16)?, num(17..19)?);
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 59 {
-        return None;
-    }
-    let mut i = 19;
-    let mut nanos = 0;
-    if sep(i, b'.') {
-        let n = b[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
-        if n == 0 {
-            return None;
-        }
-        for k in 0..9 {
-            nanos = nanos * 10 + if k < n { i64::from(b[i + 1 + k] - b'0') } else { 0 };
-        }
-        i += 1 + n;
-    }
-    let offset = match b.get(i) {
-        Some(b'Z') if i + 1 == b.len() => 0,
-        Some(&c @ (b'+' | b'-')) if i + 6 == b.len() && sep(i + 3, b':') => {
-            let o = num(i + 1..i + 3)? * 3600 + num(i + 4..i + 6)? * 60;
-            if c == b'-' { -o } else { o }
-        }
-        _ => return None,
-    };
-    let secs = days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec - offset;
-    Some(secs * SEC + nanos)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
-
-    #[test]
-    fn rfc3339_parses_zulu_offsets_and_fractions() {
-        assert_eq!(parse_rfc3339("1970-01-01T00:00:01Z"), Some(SEC));
-        assert_eq!(parse_rfc3339("1970-01-01T07:00:00+07:00"), Some(0));
-        assert_eq!(parse_rfc3339("2026-01-05T10:20:30.5Z"), Some((days_from_civil(2026, 1, 5) * 86_400 + 37_230) * SEC + SEC / 2));
-        assert_eq!(parse_rfc3339("2026-01-05 10:20:30Z"), None);
-        assert_eq!(parse_rfc3339("2026-13-05T10:20:30Z"), None);
-    }
-
-    #[test]
-    fn filter_summaries_and_handbacks() {
-        assert!(may_be_relevant(br#"{"x":1,"type" : "user"}"#));
-        assert!(!may_be_relevant(br#"{"type":"progress","data":{"type":"x"}}"#));
-        assert_eq!(agent_message_from(r#"hi <agent-message from="" x <agent-message from="a-1_b">"#), Some("a-1_b"));
-        assert_eq!(short_path("/a/b/c/d.rs"), "…/c/d.rs");
-        assert_eq!(short_path("b/c.rs"), "b/c.rs");
-        assert_eq!(truncate("abcdef", 4), "abc…");
-        assert_eq!(one_line("\n  first line \nsecond", 60), "first line");
-        let v: Value = serde_json::from_str(r#"{"description":"look","subagent_type":"Explore"}"#).unwrap();
-        assert_eq!(tool_summary("Agent", &v, 50), "Agent: look (Explore)");
-        assert_eq!(tool_summary("Grep", &Value::Null, 50), "Grep");
-    }
 
     #[test]
     fn root_labels_name_the_config_dir() {
@@ -928,7 +477,7 @@ mod tests {
         assert_eq!(Root::new("/tmp/fixture".into()).label, "fixture");
     }
 
-    fn write(path: &Path, lines: &[&str]) {
+    pub(super) fn write(path: &Path, lines: &[&str]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut f = fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
         for l in lines {
@@ -994,49 +543,27 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A tool call that needs the user, unanswered and quiet for a few
-    /// seconds, is Waiting: always for a question or a plan, else by the
-    /// session's permission mode, which subagents share.
+    /// A session a live process names in sessions/<pid>.json is live, even
+    /// with its transcript older than `since`, as a background session
+    /// resumed hours after its last turn; one whose process is gone is not.
     #[test]
-    fn waiting_follows_the_tool_and_the_sessions_mode() {
-        let pending = |tool: &str| FileState { last_tool_id: "t".into(), last_tool_name: tool.into(), ..FileState::default() };
-        let at = |st: &FileState, mode: &str, age: i64| build(st, "x".into(), 0, age, false, mode).status;
-        for (tool, mode, want) in [
-            ("Bash", "default", Status::Waiting),
-            ("Bash", "plan", Status::Waiting),
-            ("Bash", "auto", Status::Running),
-            ("Bash", "bypassPermissions", Status::Running),
-            ("Bash", "", Status::Running),
-            ("Edit", "acceptEdits", Status::Running),
-            ("Bash", "acceptEdits", Status::Waiting),
-            ("Read", "default", Status::Running),
-            ("Agent", "plan", Status::Running),
-            ("AskUserQuestion", "auto", Status::Waiting),
-            ("ExitPlanMode", "bypassPermissions", Status::Waiting),
-        ] {
-            assert_eq!(at(&pending(tool), mode, 5 * SEC), want, "{tool} in {mode:?}");
-        }
-        assert_eq!(at(&pending("Bash"), "default", SEC), Status::Running, "not quiet long enough yet");
-        assert_eq!(at(&pending("Bash"), "default", 2 * WAIT_WINDOW), Status::Idle, "long gone");
-        let mut answered = pending("AskUserQuestion");
-        answered.resolved.insert("t".into());
-        assert_eq!(at(&answered, "default", 5 * SEC), Status::Active);
-
-        let dir = std::env::temp_dir().join(format!("office-wait-{}", std::process::id()));
+    fn a_session_a_running_process_holds_is_live_however_quiet() {
+        let dir = std::env::temp_dir().join(format!("office-live-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        let proj = dir.join("projects").join("-home-me-proj");
-        write(&proj.join("s1.jsonl"), &[
-            r#"{"type":"permission-mode","permissionMode":"auto","sessionId":"s1"}"#,
-            r#"{"type":"permission-mode","permissionMode":"default","sessionId":"s1"}"#,
-            r#"{"type":"assistant","timestamp":"2026-01-01T10:00:00Z","message":{"id":"m1","content":[{"type":"tool_use","id":"tu1","name":"Agent","input":{"description":"d"}}]}}"#,
-        ]);
-        write(&proj.join("s1").join("subagents").join("agent-a1.jsonl"), &[
-            r#"{"type":"assistant","timestamp":"2026-01-01T10:00:01Z","message":{"id":"x1","content":[{"type":"tool_use","id":"tu2","name":"Bash","input":{"command":"rm -rf build"}}]}}"#,
-        ]);
-        let now = mtime(&fs::metadata(proj.join("s1").join("subagents").join("agent-a1.jsonl")).unwrap()) + 5 * SEC;
-        let snap = Scanner::new(vec![Root::new(dir.join("projects"))], 0).scan(now);
-        assert_eq!(snap.by_id["a1"].status, Status::Waiting, "the subagent runs in its session's last mode");
-        assert_eq!(snap.by_id["s1"].status, Status::Running, "spawning asks no one");
+        let cfg = dir.join(".claude-work");
+        let line = r#"{"type":"user","timestamp":"2026-01-01T09:00:00Z","cwd":"/p","message":{"content":"hi"}}"#;
+        for s in ["held", "gone"] {
+            write(&cfg.join("projects").join("-p").join(format!("{s}.jsonl")), &[line]);
+        }
+        fs::create_dir_all(cfg.join("sessions")).unwrap();
+        fs::write(cfg.join("sessions").join("1.json"), format!(r#"{{"pid":{},"sessionId":"held","kind":"bg"}}"#, std::process::id())).unwrap();
+        fs::write(cfg.join("sessions").join("2.json"), r#"{"pid":999999999,"sessionId":"gone","kind":"bg"}"#).unwrap();
+        let now = mtime(&fs::metadata(cfg.join("projects").join("-p").join("held.jsonl")).unwrap()) + 48 * 3600 * SEC;
+        let snap = Scanner::new(vec![Root::new(cfg.join("projects"))], 24 * 3600 * SEC).scan(now);
+        assert_eq!(snap.roots, ["held"], "a quiet session no process holds is past `since`");
+        assert!(snap.by_id["held"].live);
+        let snap = Scanner::new(vec![Root::new(cfg.join("projects"))], 0).scan(now);
+        assert!(snap.by_id["held"].live && !snap.by_id["gone"].live);
         let _ = fs::remove_dir_all(&dir);
     }
 }
