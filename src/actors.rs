@@ -1,10 +1,12 @@
 //! The agents on the office picture, all sessions in one room: the places
-//! they take (the manager's desk, nine open-plan desks, lounge seats, the
-//! entrance) and the corridors between them, as fractions of office.png; who
-//! sits where (`layout`: the agents of active sessions, the residents, by the
-//! rules below); how they walk there, and how agents
-//! of inactive sessions drop in as visitors (`Walker`); and drawing them with
-//! their marks and links (`paint`).
+//! they take (work: the manager's desk, nine open-plan desks, the meeting
+//! room's chairs; rest: seats in the lounges, the kitchen and the manager's
+//! sofa), the entrance and the corridors between them, as fractions of
+//! office.png; who sits where (`layout`: the agents of active sessions, the
+//! residents, by the rules below); how they walk there, and how agents of
+//! inactive sessions drop in as visitors (`Walker`); and drawing them with
+//! their marks and links (`paint`), and the pet that strolls round the
+//! lobby (`Pet`, `paint_pet`).
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -36,6 +38,10 @@ const VISITOR_SPEED: f64 = 0.6 * WALK_SPEED;
 const VISIT_EVERY: (f64, f64) = (4.0, 12.0);
 /// Seconds a visitor may wait at a stop, at least and at most.
 const VISIT_WAIT: (f64, f64) = (1.0, 3.0);
+/// Seconds the pet waits at each of its stops, at least and at most.
+const PET_WAIT: (f64, f64) = (1.0, 4.0);
+/// How fast the pet strolls: slower than visitors, who so pass it.
+const PET_SPEED: f64 = 0.5 * VISITOR_SPEED;
 
 /// The places and corridors, built once from office.png measurements.
 pub struct Graph {
@@ -43,16 +49,18 @@ pub struct Graph {
     adj: Vec<Vec<usize>>,
     pub exit: usize,
     pub lead_desk: usize,
-    pub desks: Vec<usize>, // subagent desks, row by row
-    pub seats: Vec<usize>, // lounge seats, in the order they fill
-    pub stops: Vec<usize>, // where visitors may wait: no place, clear of every place
+    pub desks: Vec<usize>,  // the open plan's desks, row by row
+    pub chairs: Vec<usize>, // the meeting room's: work places once the desks are taken
+    pub seats: Vec<usize>,  // rest seats, in the order they fill: one room after another
+    pub stops: Vec<usize>,  // where visitors may wait: no place, clear of every place
+    pub pet_stops: Vec<usize>, // the lobby's nodes the pet strolls between: not the entrance
 }
 
 /// The picture the measurements were taken on is 1254×1254.
 const SIZE: f64 = 1254.0;
 
 pub static GRAPH: LazyLock<Graph> = LazyLock::new(|| {
-    let mut g = Graph { nodes: Vec::new(), adj: Vec::new(), exit: 0, lead_desk: 0, desks: Vec::new(), seats: Vec::new(), stops: Vec::new() };
+    let mut g = Graph { nodes: Vec::new(), adj: Vec::new(), exit: 0, lead_desk: 0, desks: Vec::new(), chairs: Vec::new(), seats: Vec::new(), stops: Vec::new(), pet_stops: Vec::new() };
     let mut n = |x: f64, y: f64| {
         g.nodes.push(Point { x: x / SIZE, y: y / SIZE });
         g.adj.push(Vec::new());
@@ -62,10 +70,20 @@ pub static GRAPH: LazyLock<Graph> = LazyLock::new(|| {
     let exit = n(630.0, 118.0);
     let (lob_n, lob_nw, lob_ne) = (n(630.0, 190.0), n(455.0, 190.0), n(805.0, 190.0));
     let (lob_sw, lob_s, lob_se) = (n(455.0, 420.0), n(630.0, 420.0), n(805.0, 420.0));
-    // Top-left lounge, through its door on the lobby's west wall.
-    let (tl_out, tl_in) = (n(425.0, 330.0), n(318.0, 305.0));
+    // Top-left lounge, through its door on the lobby's west wall; a stop in
+    // front of the coffee table.
+    let (tl_out, tl_in, tl_s) = (n(425.0, 330.0), n(318.0, 305.0), n(205.0, 315.0));
     let (tl_gap_s, tl_gap_n, tl_sw) = (n(257.0, 292.0), n(257.0, 210.0), n(150.0, 300.0));
     let (tl_sofa, tl_arm_l, tl_arm_r) = (n(203.0, 198.0), n(119.0, 266.0), n(290.0, 250.0));
+    // Washroom, through its door on the lobby's west strip, to the sinks.
+    let (wc_out, wc_in, wc_n, wc_w) = (n(310.0, 500.0), n(228.0, 500.0), n(228.0, 425.0), n(110.0, 425.0));
+    // Meeting room, through its door on the lobby's east wall: an aisle
+    // round the table, and seven of its chairs (the rest stand too close).
+    let (mt_out, mt_in, mt_w) = (n(805.0, 390.0), n(915.0, 390.0), n(915.0, 268.0));
+    let (mt_nw, mt_n1, mt_n2) = (n(915.0, 125.0), n(992.0, 125.0), n(1093.0, 125.0));
+    let (mt_sw, mt_s, mt_se, mt_e2, mt_e1) = (n(915.0, 475.0), n(1023.0, 478.0), n(1182.0, 475.0), n(1182.0, 368.0), n(1182.0, 268.0));
+    let chairs = vec![n(992.0, 172.0), n(1093.0, 172.0), n(955.0, 268.0), n(1132.0, 268.0), n(955.0, 368.0), n(1132.0, 368.0), n(1023.0, 458.0)];
+    // The copy room has no door on the picture: nobody goes in.
     // Open plan: past either end of the planter shelf, then a grid of aisles.
     let (op_nw, op_ne) = (n(345.0, 470.0), n(835.0, 470.0));
     let (xs, ys) = ([340.0, 505.0, 650.0, 822.0], [565.0, 742.0, 905.0, 1100.0]);
@@ -82,7 +100,7 @@ pub static GRAPH: LazyLock<Graph> = LazyLock::new(|| {
     }
     // The manager's office, through its door on the open plan's east wall.
     let (mgr_out, mgr_in, mgr_w, mgr_nw) = (n(845.0, 812.0), n(945.0, 800.0), n(962.0, 735.0), n(962.0, 628.0));
-    let lead_desk = n(1048.0, 640.0);
+    let (lead_desk, mgr_sofa) = (n(1048.0, 640.0), n(990.0, 815.0));
     // Bottom-right lounge, through its door on the open plan's east wall.
     let (br_out, br_in, br_w, br_n, br_s) = (n(850.0, 1120.0), n(975.0, 1112.0), n(975.0, 1000.0), n(1060.0, 1000.0), n(1060.0, 1150.0));
     let (br_tr, br_bl, br_br) = (n(1105.0, 1042.0), n(1015.0, 1132.0), n(1108.0, 1134.0));
@@ -96,13 +114,22 @@ pub static GRAPH: LazyLock<Graph> = LazyLock::new(|| {
         g.adj[a].push(b);
         g.adj[b].push(a);
     };
-    for (a, b) in [(exit, lob_n), (lob_n, lob_nw), (lob_n, lob_ne), (lob_nw, lob_sw), (lob_ne, lob_se), (lob_sw, lob_s), (lob_s, lob_se)] {
+    for (a, b) in [(exit, lob_n), (lob_n, lob_nw), (lob_n, lob_ne), (lob_nw, lob_sw), (lob_ne, mt_out), (mt_out, lob_se), (lob_sw, lob_s), (lob_s, lob_se)] {
         e(a, b);
     }
     for (a, b) in [(lob_nw, tl_out), (lob_sw, tl_out), (tl_out, tl_in), (tl_in, tl_gap_s), (tl_gap_s, tl_gap_n), (tl_gap_n, tl_sofa)] {
         e(a, b);
     }
-    for (a, b) in [(tl_in, tl_sw), (tl_sw, tl_arm_l), (tl_in, tl_arm_r)] {
+    for (a, b) in [(tl_in, tl_s), (tl_s, tl_sw), (tl_sw, tl_arm_l), (tl_in, tl_arm_r)] {
+        e(a, b);
+    }
+    for (a, b) in [(op_nw, wc_out), (wc_out, wc_in), (wc_in, wc_n), (wc_n, wc_w)] {
+        e(a, b);
+    }
+    for (a, b) in [(mt_out, mt_in), (mt_in, mt_w), (mt_w, mt_nw), (mt_nw, mt_n1), (mt_n1, mt_n2), (mt_in, mt_sw), (mt_sw, mt_s), (mt_s, mt_se), (mt_se, mt_e2), (mt_e2, mt_e1)] {
+        e(a, b);
+    }
+    for (a, b) in [mt_n1, mt_n2, mt_w, mt_e1, mt_in, mt_e2, mt_s].into_iter().zip(chairs.iter().copied()) {
         e(a, b);
     }
     for (a, b) in [(lob_sw, op_nw), (lob_se, op_ne), (op_nw, grid[0][0]), (op_ne, grid[3][0])] {
@@ -123,7 +150,7 @@ pub static GRAPH: LazyLock<Graph> = LazyLock::new(|| {
         e(entry, grid[c + 1][r]);
         e(entry, desks[i]);
     }
-    for (a, b) in [(grid[3][1], mgr_out), (grid[3][2], mgr_out), (mgr_out, mgr_in), (mgr_in, mgr_w), (mgr_w, mgr_nw), (mgr_nw, lead_desk)] {
+    for (a, b) in [(grid[3][1], mgr_out), (grid[3][2], mgr_out), (mgr_out, mgr_in), (mgr_in, mgr_w), (mgr_w, mgr_nw), (mgr_nw, lead_desk), (mgr_in, mgr_sofa)] {
         e(a, b);
     }
     for (a, b) in [(grid[3][3], br_out), (br_out, br_in), (br_in, br_w), (br_w, br_n), (br_n, br_tr), (br_in, br_bl), (br_in, br_s), (br_s, br_br)] {
@@ -138,7 +165,13 @@ pub static GRAPH: LazyLock<Graph> = LazyLock::new(|| {
     g.exit = exit;
     g.lead_desk = lead_desk;
     g.desks = desks;
-    g.seats = vec![tl_sofa, tl_arm_l, tl_arm_r, br_tr, br_bl, br_br, stool_l, stool_r, din_tl, din_tr, din_bl, din_br];
+    g.chairs = chairs;
+    // A seat in each rest room in turn, so idle agents spread over them.
+    let rest = [vec![tl_sofa, tl_arm_l, tl_arm_r], vec![stool_l, din_tr, stool_r, din_bl, din_tl, din_br], vec![br_tr, br_bl, br_br], vec![mgr_sofa]];
+    g.seats = (0..6).flat_map(|i| rest.iter().filter_map(move |r| r.get(i).copied())).collect();
+    // Round the reception desk and to the lounge's and meeting room's doors:
+    // the shortest way between any two of them stays in the lobby.
+    g.pet_stops = vec![lob_n, lob_nw, lob_ne, lob_sw, lob_s, lob_se, tl_out, mt_out];
     let places: Vec<usize> = g.places().collect();
     g.stops = (0..g.nodes.len()).filter(|&n| n != exit && places.iter().all(|&p| p != n && apart(g.nodes[n], g.nodes[p]))).collect();
     g
@@ -152,9 +185,9 @@ fn apart(p: Point, q: Point) -> bool {
 }
 
 impl Graph {
-    /// Every place an agent can take: the manager's desk, the desks, the seats.
+    /// Every place an agent can take: the manager's desk, the desks, the chairs, the seats.
     fn places(&self) -> impl Iterator<Item = usize> + '_ {
-        [self.lead_desk].into_iter().chain(self.desks.iter().copied()).chain(self.seats.iter().copied())
+        [self.lead_desk].into_iter().chain(self.desks.iter().copied()).chain(self.chairs.iter().copied()).chain(self.seats.iter().copied())
     }
 
     fn dist(&self, a: usize, b: usize) -> f64 {
@@ -238,6 +271,7 @@ pub struct Scene {
     pub overflow: usize,
     pub sessions: usize, // active sessions
     pub left: usize,     // agents done more than LEAVE_AFTER ago, not drawn
+    pub pet: Option<Pose>, // where the pet stands, once walked
 }
 
 fn at_desk(s: Status) -> bool {
@@ -253,11 +287,12 @@ pub fn session_active(snap: &Snapshot, root: &str, now: i64) -> bool {
 }
 
 /// Places the agents of every active session as of now, the residents:
-/// running and active ones at desks, idle and done ones on lounge seats, the
-/// manager's desk for the most recently active lead at a desk, the other
-/// leads before the subagents. Each keeps the place it had in `was` (the last
-/// scene) while that still suits it, so two busy sessions do not trade desks
-/// on every scan. Residents left without a place, then every agent of the
+/// running and active ones at desks, then on the meeting room's chairs; idle
+/// and done ones on rest seats, a room at a time; the manager's desk for the
+/// most recently active lead at a desk, the other leads before the
+/// subagents. Each keeps the place it had in `was` (the last scene) while
+/// that still suits it, so two busy sessions do not trade desks on every
+/// scan. Residents left without a place, then every agent of the
 /// inactive sessions (leads first), are the guests visitors come from.
 pub fn layout(snap: &Snapshot, now: i64, was: &Scene) -> Scene {
     let g = &*GRAPH;
@@ -282,7 +317,8 @@ pub fn layout(snap: &Snapshot, now: i64, was: &Scene) -> Scene {
         place[i] = Some(g.lead_desk);
     }
     let mut taken: HashSet<usize> = place.iter().flatten().copied().collect();
-    let suits = |a: &Agent| if at_desk(a.status) { &g.desks } else { &g.seats };
+    let work: Vec<usize> = g.desks.iter().chain(&g.chairs).copied().collect();
+    let suits = |a: &Agent| if at_desk(a.status) { &work } else { &g.seats };
     for (i, a) in residents.iter().enumerate() {
         if let (None, Some(&n)) = (place[i], had.get(a.id.as_str()).filter(|n| suits(a).contains(n) && !taken.contains(n))) {
             place[i] = Some(n);
@@ -397,6 +433,7 @@ struct Visit {
     m: Mover,
     stops: VecDeque<(usize, f64)>,
     waited: f64,
+    speed: f64,
 }
 
 impl Visit {
@@ -413,7 +450,7 @@ impl Visit {
         stops.push_back((g.exit, 0.0));
         let mut m = Mover { pos: g.nodes[g.exit], from: g.exit, path: VecDeque::new(), left: false, actor, gone: false };
         m.head_for(stops[0].0);
-        Visit { m, stops, waited: 0.0 }
+        Visit { m, stops, waited: 0.0, speed: VISITOR_SPEED }
     }
 
     /// Whether it stands at a stop, waiting.
@@ -425,7 +462,7 @@ impl Visit {
     fn walk(&mut self, dt: f64) -> bool {
         loop {
             if !self.m.path.is_empty() {
-                self.m.advance(VISITOR_SPEED * dt);
+                self.m.advance(self.speed * dt);
                 return true;
             }
             let Some(&(_, wait)) = self.stops.front() else { return false };
@@ -467,25 +504,70 @@ impl Rng {
     }
 }
 
+/// The office pet: a visitor that never leaves the lobby. It walks from one
+/// of GRAPH.pet_stops to another, waiting PET_WAIT at each, for good: its
+/// round is topped up whenever it runs short.
+#[derive(Clone, Debug)]
+struct Pet {
+    v: Visit,
+    rng: Rng,
+}
+
+impl Pet {
+    /// Waiting at one of its stops, picked by seed.
+    fn new(seed: u64) -> Pet {
+        let g = &*GRAPH;
+        let mut rng = Rng::new(seed);
+        let at = g.pet_stops[rng.below(g.pet_stops.len())];
+        let pos = g.nodes[at];
+        let actor = Actor { id: PET.into(), kind: "pet".into(), status: Status::Idle, node: at, pos, anim: Anim::Idle, left: false, selected: false, lead: false, sprite: 0, visitor: false };
+        let m = Mover { pos, from: at, path: VecDeque::new(), left: false, actor, gone: false };
+        let stops = VecDeque::from([(at, rng.range(PET_WAIT))]);
+        Pet { v: Visit { m, stops, waited: 0.0, speed: PET_SPEED }, rng }
+    }
+
+    /// Walks or waits dt seconds; where it stands then. Waiting where one of
+    /// `others` stands, it walks on instead.
+    fn walk(&mut self, dt: f64, mut others: impl Iterator<Item = Point>) -> Pose {
+        let g = &*GRAPH;
+        if let (true, Some(&(_, wait))) = (self.v.m.path.is_empty(), self.v.stops.front())
+            && others.any(|p| !apart(p, self.v.m.pos))
+        {
+            self.v.waited = self.v.waited.max(wait);
+        }
+        while self.v.stops.len() < 2 {
+            let last = self.v.stops.back().map_or(self.v.m.from, |&(n, _)| n);
+            let next: Vec<usize> = g.pet_stops.iter().copied().filter(|&n| n != last).collect();
+            let stop = (next[self.rng.below(next.len())], self.rng.range(PET_WAIT));
+            self.v.stops.push_back(stop);
+        }
+        self.v.walk(dt);
+        Pose { p: self.v.m.pos, left: self.v.m.left, moving: !self.v.m.path.is_empty() }
+    }
+}
+
 /// Carries actors between the places successive layouts give them: an actor
 /// whose place changed walks there along the corridors; a newcomer walks in
 /// from the entrance; one that vanished walks out to it. Every VISIT_EVERY
 /// seconds, while fewer than MAX_VISITORS are in, a guest of the scene comes
 /// in for a round: the one with the fewest visits so far (residents with no
-/// place before the rest), first in line among equals.
+/// place before the rest), first in line among equals. The pet strolls on
+/// all the while.
 pub struct Walker {
     movers: HashMap<String, Mover>,
     visits: Vec<Visit>,
     seen: HashMap<String, u32>, // visits so far, by agent
     next: Option<f64>,          // when the next visitor may come in
     rng: Rng,
+    pet: Pet, // its own dice, so the visitors' are as they were
     last: Option<f64>,
     primed: bool,
 }
 
 impl Walker {
     pub fn new(seed: u64) -> Walker {
-        Walker { movers: HashMap::new(), visits: Vec::new(), seen: HashMap::new(), next: None, rng: Rng::new(seed), last: None, primed: false }
+        let pet = Pet::new(seed.rotate_left(32));
+        Walker { movers: HashMap::new(), visits: Vec::new(), seen: HashMap::new(), next: None, rng: Rng::new(seed), pet, last: None, primed: false }
     }
 
     /// Forgets every resident, so the next step places them without walking.
@@ -494,8 +576,8 @@ impl Walker {
     }
 
     /// Advances the walk to sec (seconds on any steady clock) and rewrites
-    /// sc: actors on their way are drawn where they are, walking, and the
-    /// visitors join the actors and the roster.
+    /// sc: actors on their way are drawn where they are, walking, the
+    /// visitors join the actors and the roster, and the pet is where it is.
     pub fn step(&mut self, sc: &mut Scene, sec: f64) {
         let g = &*GRAPH;
         let dt = self.last.map_or(0.0, |l| (sec - l).clamp(0.0, 0.25));
@@ -559,6 +641,7 @@ impl Walker {
             sc.roster.push(v.m.actor.id.clone());
             sc.actors.push(Actor { pos: v.m.pos, left: v.m.left, anim, ..v.m.actor.clone() });
         }
+        sc.pet = Some(self.pet.walk(dt, sc.actors.iter().map(|a| a.pos)));
         self.primed = true;
     }
 }
@@ -583,6 +666,19 @@ const LETTER: [&str; 6] = ["#########", "##.....##", "#.#...#.#", "#..#.#..#", "
 pub struct Item {
     pub key: u64,
     pub rects: Vec<[u32; 4]>,
+}
+
+/// The pet's item key: no agent id or link looks like it.
+pub const PET: &str = "pet:";
+
+/// Draws frame i of the pet (pet: its sprite at its size on l) at ps, sec
+/// into its walk. Its key changes only with the frame and where it is drawn.
+pub fn paint_pet(canvas: &mut RgbaImage, l: &Layout, office: (u32, u32), pet: &Scaled, i: usize, ps: Pose, sec: f64) -> Item {
+    let i = i.min(pet.frames.len() - 1);
+    let rect = scene::draw_character(canvas, l, office, &pet.frames[i], ps, sec);
+    let mut h = DefaultHasher::new();
+    (rect, i).hash(&mut h);
+    Item { key: h.finish(), rects: vec![rect] }
 }
 
 /// Draws the actors and links of sc onto canvas (the office base) at t,
@@ -753,7 +849,7 @@ mod tests {
     fn places_and_stops_never_overlap() {
         let g = &*GRAPH;
         let places: Vec<usize> = g.places().collect();
-        assert_eq!((g.desks.len(), g.seats.len()), (9, 12));
+        assert_eq!((g.desks.len(), g.chairs.len(), g.seats.len()), (9, 7, 13));
         for (i, &a) in places.iter().enumerate() {
             for &b in &places[i + 1..] {
                 let (p, q) = (g.nodes[a], g.nodes[b]);
@@ -783,9 +879,10 @@ mod tests {
             let (lo, hi) = (p[0].min(p[1]).min(p[2]), p[0].max(p[1]).max(p[2]));
             lo >= 195 && hi - lo <= 16
         };
-        // The top-left lounge's and the manager's doors are painted on the
-        // outer face of a wall 18 px thick: going through crosses that.
-        const DOORS: [(f64, f64); 2] = [(370.0, 318.0), (911.0, 806.0)];
+        // The top-left lounge's, the manager's, the washroom's and the
+        // meeting room's doors are painted on the outer face of a wall 18 px
+        // thick: going through crosses that.
+        const DOORS: [(f64, f64); 4] = [(370.0, 318.0), (911.0, 806.0), (257.0, 500.0), (880.0, 390.0)];
         for (a, near) in g.adj.iter().enumerate() {
             for &b in near {
                 let (p, q) = (g.nodes[a], g.nodes[b]);
@@ -799,9 +896,10 @@ mod tests {
         }
     }
 
-    /// Draws the corridors (red), places (desks blue, seats green), the
-    /// visitors' stops (magenta) and the entrance (yellow) over office.png,
-    /// to look at:
+    /// Draws the corridors (red), places (desks blue, meeting chairs cyan,
+    /// seats green, each seat numbered by the order it fills), the
+    /// visitors' stops (magenta), the entrance (yellow) and the pet's stops
+    /// (orange rings) over office.png, to look at:
     /// OFFICE_GRAPH_PNG=/tmp/g.png cargo test graph_picture -- --ignored
     #[test]
     #[ignore]
@@ -823,20 +921,30 @@ mod tests {
         for &d in g.desks.iter().chain([&g.lead_desk]) {
             dot(&mut img, d, [60, 120, 255]);
         }
-        for &s in &g.seats {
+        for &c in &g.chairs {
+            dot(&mut img, c, [40, 230, 240]);
+        }
+        for (i, &s) in g.seats.iter().enumerate() {
             dot(&mut img, s, [60, 220, 90]);
+            // Its place in the filling order, in white ticks under it.
+            let (x, y) = px(g.nodes[s]);
+            scene::draw_art(&mut img, &["#.".repeat(i + 1).as_str()], x as i64 - 6, y as i64 + 10, 3, |c| (c == '#').then_some([255, 255, 255]));
         }
         for &s in &g.stops {
             dot(&mut img, s, [230, 60, 230]);
         }
         dot(&mut img, g.exit, [255, 220, 0]);
+        for &s in &g.pet_stops {
+            let (x, y) = px(g.nodes[s]);
+            scene::draw_art(&mut img, &["#####", "#...#", "#...#", "#...#", "#####"], x as i64 - 10, y as i64 - 10, 4, |c| (c == '#').then_some([255, 140, 0]));
+        }
         img.save(out).unwrap();
     }
 
     #[test]
     fn every_place_is_reachable_from_the_entrance() {
         let g = &*GRAPH;
-        for &p in g.desks.iter().chain(&g.seats).chain([&g.lead_desk]) {
+        for &p in g.desks.iter().chain(&g.chairs).chain(&g.seats).chain([&g.lead_desk]) {
             let (path, len) = g.path(g.exit, p);
             assert!(len.is_finite() && path.first() == Some(&g.exit) && path.last() == Some(&p), "{p}: {path:?}");
         }
@@ -911,14 +1019,15 @@ mod tests {
     #[test]
     fn residents_beyond_the_places_become_visitors_first() {
         let g = &*GRAPH;
-        let ids: Vec<String> = (0..12).map(|i| format!("r{i:02}")).collect();
+        let ids: Vec<String> = (0..20).map(|i| format!("r{i:02}")).collect();
         let subs: Vec<(&str, Status)> = ids.iter().map(|id| (id.as_str(), Status::Running)).collect();
         let snap = sessions(&[("x", Status::Running, 0, &subs), ("y", Status::Running, SEC, &[]), ("z", Status::Idle, 3600 * SEC, &[])]);
         let sc = layout(&snap, NOW, &Scene::default());
-        // Ten desks for two leads and twelve runners: four have none.
-        assert_eq!((sc.actors.len(), sc.overflow), (10, 4));
-        assert_eq!(sc.guests.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["r08", "r09", "r10", "r11", "z"]);
-        assert!(sc.actors.iter().all(|a| a.node == g.lead_desk || g.desks.contains(&a.node)));
+        // Seventeen work places (the manager's desk, nine desks, seven
+        // meeting chairs) for two leads and twenty runners: five have none.
+        assert_eq!((sc.actors.len(), sc.overflow), (17, 5));
+        assert_eq!(sc.guests.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["r15", "r16", "r17", "r18", "r19", "z"]);
+        assert!(sc.actors.iter().all(|a| a.node == g.lead_desk || g.desks.contains(&a.node) || g.chairs.contains(&a.node)));
         assert_one_each(&sc);
         // The first visitor is one of them.
         let mut w = Walker::new(3);
@@ -927,7 +1036,7 @@ mod tests {
             let mut sc = layout(&snap, NOW, &was);
             w.step(&mut sc, f64::from(i) * 0.05);
             if let Some(v) = sc.actors.iter().find(|a| a.visitor) {
-                assert_eq!(v.id, "r08");
+                assert_eq!(v.id, "r15");
                 return;
             }
             was = sc;
@@ -935,15 +1044,155 @@ mod tests {
         panic!("no visitor in 20 s");
     }
 
-    /// The distance from p to the nearest corridor.
-    fn off_corridor(p: Point) -> f64 {
+    /// The room of office.png a point lies in, by rectangles (pixels of the
+    /// 1254 px picture) read off the picture, not off the graph. The copy
+    /// room is left out: no door leads into it.
+    fn room_of(p: Point) -> Option<&'static str> {
+        const ROOMS: [(&str, [f64; 4]); 10] = [
+            ("lobby", [380.0, 120.0, 850.0, 345.0]),
+            ("lobby", [285.0, 345.0, 870.0, 445.0]),
+            ("lobby", [285.0, 445.0, 340.0, 530.0]),
+            ("top-left lounge", [45.0, 40.0, 375.0, 335.0]),
+            ("washroom", [45.0, 345.0, 265.0, 530.0]),
+            ("kitchen", [45.0, 717.0, 285.0, 1165.0]),
+            ("open plan", [285.0, 445.0, 870.0, 1165.0]),
+            ("meeting room", [860.0, 40.0, 1215.0, 495.0]),
+            ("manager's office", [890.0, 515.0, 1215.0, 870.0]),
+            ("bottom-right lounge", [920.0, 890.0, 1215.0, 1165.0]),
+        ];
+        let (x, y) = (p.x * SIZE, p.y * SIZE);
+        ROOMS.iter().find(|(_, [x0, y0, x1, y1])| (*x0..*x1).contains(&x) && (*y0..*y1).contains(&y)).map(|(name, _)| *name)
+    }
+
+    /// Visitors can wait in every room with a door, and walk there.
+    #[test]
+    fn every_room_has_a_reachable_stop() {
+        let g = &*GRAPH;
+        for room in ["lobby", "top-left lounge", "washroom", "kitchen", "open plan", "meeting room", "manager's office", "bottom-right lounge"] {
+            let stops: Vec<usize> = g.stops.iter().copied().filter(|&s| room_of(g.nodes[s]) == Some(room)).collect();
+            assert!(stops.iter().any(|&s| g.path(g.exit, s).1.is_finite()), "{room}: no reachable stop among {stops:?}");
+        }
+    }
+
+    /// One idle agent per rest room before any room gets a second, while
+    /// the lead works at the manager's desk.
+    #[test]
+    fn idle_agents_spread_over_the_rest_rooms() {
+        let g = &*GRAPH;
+        let snap = snapshot(&[("i1", Status::Idle), ("i2", Status::Done), ("i3", Status::Idle), ("i4", Status::Idle)]);
+        let sc = layout(&snap, NOW, &Scene::default());
+        let room = |id: &str| room_of(sc.actors.iter().find(|a| a.id == id).map(|a| a.pos).unwrap());
+        let rooms: Vec<_> = ["i1", "i2", "i3", "i4"].map(room).into_iter().collect();
+        assert_eq!(rooms, [Some("top-left lounge"), Some("kitchen"), Some("bottom-right lounge"), Some("manager's office")]);
+        assert_eq!(room("s"), Some("manager's office"), "the lead at its desk");
+        assert_one_each(&sc);
+        // Every rest seat is in a rest room, and the first three are in
+        // three rooms.
+        let rest: HashSet<_> = g.seats.iter().map(|&s| room_of(g.nodes[s]).unwrap()).collect();
+        assert_eq!(rest, ["top-left lounge", "kitchen", "bottom-right lounge", "manager's office"].into());
+        let first: HashSet<_> = g.seats[..3].iter().map(|&s| room_of(g.nodes[s])).collect();
+        assert_eq!(first.len(), 3);
+    }
+
+    /// Twelve running subagents: the nine desks, then three meeting chairs,
+    /// every sprite clear of the others.
+    #[test]
+    fn runners_beyond_the_desks_take_the_meeting_room() {
+        let g = &*GRAPH;
+        let ids: Vec<String> = (0..12).map(|i| format!("r{i:02}")).collect();
+        let subs: Vec<(&str, Status)> = ids.iter().map(|id| (id.as_str(), Status::Running)).collect();
+        let sc = layout(&snapshot(&subs), NOW, &Scene::default());
+        let nodes: Vec<usize> = sc.actors.iter().filter(|a| a.id.starts_with('r')).map(|a| a.node).collect();
+        assert_eq!(nodes[..9], g.desks[..], "the desks first");
+        assert_eq!(nodes[9..], g.chairs[..3]);
+        assert!(nodes[9..].iter().all(|&n| room_of(g.nodes[n]) == Some("meeting room")));
+        assert_eq!((sc.actors.len(), sc.overflow), (13, 0));
+        assert_one_each(&sc);
+        for (i, a) in sc.actors.iter().enumerate() {
+            for b in &sc.actors[i + 1..] {
+                assert!(apart(a.pos, b.pos), "{} at {:?} and {} at {:?} overlap", a.id, a.pos, b.id, b.pos);
+            }
+        }
+    }
+
+    /// One minute, 100 ms a step (600 frames), of a room where visitors come
+    /// and go, and the pet strolls: where it stands each frame, and the most
+    /// frames in a row it overlapped one agent, and stood still overlapping one.
+    fn pet_walk(seed: u64) -> (Vec<Pose>, usize, usize) {
+        const HOUR: i64 = 3600 * SEC;
+        let snap = sessions(&[
+            ("a", Status::Running, 0, &[("a1", Status::Running), ("a2", Status::Idle)]),
+            ("v1", Status::Idle, HOUR, &[]),
+            ("v2", Status::Idle, HOUR, &[]),
+            ("v3", Status::Idle, HOUR, &[]),
+        ]);
+        let mut w = Walker::new(seed);
+        let (mut was, mut poses, mut together, mut most) = (Scene::default(), Vec::new(), HashMap::<String, usize>::new(), 0);
+        let (mut still, mut most_still) = (0, 0);
+        for i in 0..600 {
+            let mut sc = layout(&snap, NOW, &was);
+            w.step(&mut sc, f64::from(i) * 0.1);
+            let pet = sc.pet.expect("the pet is always there");
+            together = sc.actors.iter().filter(|a| !apart(a.pos, pet.p)).map(|a| (a.id.clone(), together.get(&a.id).map_or(1, |n| n + 1))).collect();
+            most = together.values().copied().fold(most, usize::max);
+            still = if !pet.moving && !together.is_empty() { still + 1 } else { 0 };
+            most_still = most_still.max(still);
+            poses.push(pet);
+            was = sc;
+        }
+        (poses, most, most_still)
+    }
+
+    /// The pet stays in the lobby for good, walking only the corridors
+    /// between its stops (never to the entrance, never into another room),
+    /// waits at three stops or more a minute, and never stands where an
+    /// agent is: it makes way at once, and they only pass (slower than
+    /// visitors, it is overtaken). Its stops are no agent's place. The same
+    /// seed walks it the same way.
+    #[test]
+    fn the_pet_strolls_round_the_lobby() {
+        let g = &*GRAPH;
+        assert!(g.pet_stops.iter().all(|s| g.stops.contains(s) && room_of(g.nodes[*s]) == Some("lobby")), "{:?}", g.pet_stops);
+        let (poses, most, still) = pet_walk(4);
+        let mut waited_at: HashSet<usize> = HashSet::new();
+        for (i, ps) in poses.iter().enumerate() {
+            assert_eq!(room_of(ps.p), Some("lobby"), "frame {i}: {:?}", ps.p);
+            assert!(off_edges(ps.p, |n| g.pet_stops.contains(&n)) < 1e-9, "frame {i}: {:?} off the lobby's corridors", ps.p);
+            if !ps.moving {
+                waited_at.extend(g.pet_stops.iter().copied().filter(|&s| g.nodes[s] == ps.p));
+            }
+        }
+        assert!(waited_at.len() >= 3, "waited at {waited_at:?}");
+        assert!(poses.iter().filter(|ps| ps.moving).count() > 100, "it walks");
+        // Over 30 seeds the longest pass took 63 frames, at its pace.
+        for (seed, (_, most, still)) in (0..30).map(|seed| (seed, pet_walk(seed))) {
+            assert!(still <= 1 && most <= 80, "seed {seed}: overlapped one agent {most} frames in a row, {still} of them standing");
+        }
+        assert!(most > 0 && still <= 1, "it meets visitors");
+        assert_eq!(pet_walk(4).0, poses);
+        assert_ne!(pet_walk(5).0, poses);
+    }
+
+    /// The distance from p to the nearest corridor between two nodes `on` keeps.
+    fn off_edges(p: Point, on: impl Fn(usize) -> bool) -> f64 {
         let g = &*GRAPH;
         let seg = |a: Point, b: Point| {
             let (dx, dy) = (b.x - a.x, b.y - a.y);
             let k = (((p.x - a.x) * dx + (p.y - a.y) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
             (p.x - a.x - k * dx).hypot(p.y - a.y - k * dy)
         };
-        g.adj.iter().enumerate().flat_map(|(a, near)| near.iter().map(move |&b| seg(g.nodes[a], g.nodes[b]))).fold(f64::INFINITY, f64::min)
+        let on = &on;
+        g.adj
+            .iter()
+            .enumerate()
+            .filter(|&(a, _)| on(a))
+            .flat_map(|(a, near)| near.iter().filter(|&&b| on(b)).map(move |&b| seg(g.nodes[a], g.nodes[b])))
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// The distance from p to the nearest corridor.
+    fn off_corridor(p: Point) -> f64 {
+        off_edges(p, |_| true)
     }
 
     /// Five minutes of a room with one resident and six guests, 50 ms a

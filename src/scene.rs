@@ -12,6 +12,9 @@ use image::{
 use ratatui::layout::Rect;
 
 pub const CHARACTER_HEIGHT: f64 = 0.07; // of the office height
+/// How tall the pet usually looks: its typical frame, not the box around
+/// all of them (see Sprite::typical_height).
+pub const PET_HEIGHT: f64 = 0.6 * CHARACTER_HEIGHT;
 /// Widest a character may be, for its height: sprites wider than this are
 /// narrowed, so places CHARACTER_HEIGHT·MAX_ASPECT apart never overlap.
 pub const MAX_ASPECT: f64 = 0.9;
@@ -59,7 +62,12 @@ impl Layout {
 
     /// A character's height in canvas pixels.
     pub fn character_height(&self) -> u32 {
-        ((CHARACTER_HEIGHT * f64::from(self.office[3])).round() as u32).max(1)
+        self.height(CHARACTER_HEIGHT)
+    }
+
+    /// Canvas pixels of h, a fraction of the office height.
+    fn height(&self, h: f64) -> u32 {
+        ((h * f64::from(self.office[3])).round() as u32).max(1)
     }
 }
 
@@ -161,10 +169,27 @@ impl Sprite {
         self.frames.len() - 1
     }
 
-    /// Every frame scaled to the height characters have on layout l, and a
+    /// How tall the figure usually looks, as a fraction of the sprite's
+    /// height: the median of the frames' heights over their own opaque
+    /// pixels. A sprite whose figure jumps or floats now and then is much
+    /// taller than its figure at rest.
+    pub fn typical_height(&self) -> f64 {
+        let mut hs: Vec<u32> = self
+            .frames
+            .iter()
+            .map(|(f, _)| {
+                let rows: Vec<u32> = (0..f.height()).filter(|&y| (0..f.width()).any(|x| f.get_pixel(x, y)[3] > 0)).collect();
+                rows.last().map_or(0, |&last| last + 1 - rows[0])
+            })
+            .collect();
+        hs.sort_unstable();
+        f64::from(hs[hs.len() / 2]) / f64::from(self.frames[0].0.height())
+    }
+
+    /// Every frame scaled to `height` (of the office) on layout l, and a
     /// dimmed copy of the first. Made once per layout.
-    pub fn scaled(&self, l: &Layout) -> Scaled {
-        let (w, h) = character_size(l, self.frames[0].0.dimensions());
+    pub fn scaled(&self, l: &Layout, height: f64) -> Scaled {
+        let (w, h) = size(l.height(height), self.frames[0].0.dimensions());
         let frames: Vec<RgbaImage> = self.frames.iter().map(|(f, _)| scale(f, w, h)).collect();
         let mut dimmed = frames[0].clone();
         for p in dimmed.pixels_mut() {
@@ -224,10 +249,9 @@ fn clear_background(f: &mut RgbaImage) {
     }
 }
 
-/// The canvas size of a character whose frames are `frame` pixels on layout
-/// l: CHARACTER_HEIGHT of the office tall, at most MAX_ASPECT as wide.
-fn character_size(l: &Layout, frame: (u32, u32)) -> (u32, u32) {
-    let h = l.character_height();
+/// The canvas size of a sprite whose frames are `frame` pixels, h canvas
+/// pixels tall: at most MAX_ASPECT as wide.
+fn size(h: u32, frame: (u32, u32)) -> (u32, u32) {
     let aspect = (f64::from(frame.0) / f64::from(frame.1.max(1))).min(MAX_ASPECT);
     (((f64::from(h) * aspect).round() as u32).max(1), h)
 }
@@ -264,19 +288,10 @@ pub fn walk_bob(sec: f64) -> f64 {
     STEP_BOB * (sec * STEPS_PER_SECOND * PI).sin().abs()
 }
 
-/// Draws frame into canvas with its feet at the pose, CHARACTER_HEIGHT of the
-/// office tall, over a soft shadow, bobbing as it walks. A frame not yet at
-/// that size (not from Sprite::scaled) is scaled first. Returns the canvas
-/// pixels it may have changed as [x0, y0, x1, y1].
+/// Draws frame (at its size on l, from Sprite::scaled) into canvas with its
+/// feet at the pose, over a soft shadow, bobbing as it walks. Returns the
+/// canvas pixels it may have changed as [x0, y0, x1, y1].
 pub fn draw_character(canvas: &mut RgbaImage, l: &Layout, _office: (u32, u32), frame: &RgbaImage, ps: Pose, sec: f64) -> [u32; 4] {
-    let scaled;
-    let (cw, ch) = character_size(l, frame.dimensions());
-    let frame = if frame.height() == ch {
-        frame
-    } else {
-        scaled = scale(frame, cw, ch);
-        &scaled
-    };
     let [ox, oy, w, h] = l.office;
     let (w, h) = (i64::from(w), i64::from(h));
     let (fw, fh) = frame.dimensions();
@@ -464,6 +479,7 @@ mod tests {
         // office drawn 1:1, so it stands 7 pixels tall and 7 wide above its feet.
         let frame = RgbaImage::from_fn(2, 2, |x, _| if x == 0 { [255, 0, 0, 255].into() } else { [0, 0, 255, 255].into() });
         let l = Layout { area: Rect::default(), canvas: (100, 100), office: [0, 0, 100, 100] };
+        let frame = Sprite::from_frames(vec![(frame, DEFAULT_DELAY)]).unwrap().scaled(&l, CHARACTER_HEIGHT).frames.remove(0);
         for left in [false, true] {
             let mut img = RgbaImage::new(100, 100);
             let ps = Pose { p: Point { x: 0.5, y: 0.5 }, left, moving: false };
@@ -498,11 +514,22 @@ mod tests {
         let frame = RgbaImage::from_pixel(40, 80, [9, 9, 9, 255].into());
         let s = Sprite::from_frames(vec![(frame, DEFAULT_DELAY)]).unwrap();
         let l = Layout { area: Rect::default(), canvas: (1000, 1000), office: [0, 0, 1000, 1000] };
-        let sc = s.scaled(&l);
+        let sc = s.scaled(&l, CHARACTER_HEIGHT);
         assert_eq!(sc.frames[0].dimensions(), (35, 70));
         let mut img = RgbaImage::new(1000, 1000);
         let t = draw_character(&mut img, &l, (1000, 1000), &sc.frames[0], Pose { p: Point { x: 0.5, y: 0.5 }, left: false, moving: false }, 0.0);
         assert_eq!((t[1], t[3] >= 500), (430, true));
         assert_eq!(img.get_pixel(500, 470).0[..3], [9, 9, 9]);
+    }
+
+    /// A figure 10 px tall that jumps to 40 px in one frame of five: it
+    /// usually looks 10 px tall, a quarter of the sprite.
+    #[test]
+    fn typical_height_ignores_a_rare_jump() {
+        let frame = |top: u32| RgbaImage::from_fn(8, 40, |_, y| if y >= top { [1, 1, 1, 255].into() } else { [0, 0, 0, 0].into() });
+        let s = Sprite::from_frames([30, 30, 0, 30, 30].map(|t| (frame(t), DEFAULT_DELAY)).into()).unwrap();
+        assert_eq!(s.typical_height(), 0.25);
+        let l = Layout { area: Rect::default(), canvas: (1000, 1000), office: [0, 0, 1000, 1000] };
+        assert_eq!(s.scaled(&l, 0.05 / s.typical_height()).frames[0].height(), 200, "its figure at rest is 0.05 of the office");
     }
 }

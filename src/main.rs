@@ -24,8 +24,8 @@
 //! in the whole pane, shrunk with its proportions kept when the pane is too
 //! small, and refitted on resize. The office view is the picture alone, with
 //! no text; the selected agent is marked on it. Clicking an agent (or i)
-//! opens its card beside it, the only text on the office: its name, type,
-//! model, status and tokens, what it did, and its spawns, messages and
+//! opens its card beside it, the only text on the office: its name, role,
+//! model, status and skills, what it did, and its spawns, messages and
 //! handbacks with other agents. Clicking elsewhere (not on the card), or
 //! esc, closes it.
 //!
@@ -36,8 +36,14 @@
 //! overlap; a link's line is sent again only when it appears, goes or an
 //! end moves, while its letter's cells follow the letter. An open card is written as text over the picture when it changes,
 //! and patches leave its cells alone; when it closes or moves, its old cells
-//! are painted again. Other protocols draw the picture as a ratatui image,
-//! with the card on it.
+//! are painted again. Every frame is one synchronized update. Once more than
+//! MAX_PIECES patches show on the screen, the whole picture is painted
+//! again, at most once every WHOLE_EVERY.
+//! Other protocols draw the picture as a ratatui image, with the card on it.
+//!
+//! When the terminal reports that office lost focus (its tab or window is
+//! left), office paints the whole picture once more and then draws nothing
+//! until focus comes back, while it goes on scanning.
 //!
 //! Keys, office: click an agent (a visitor too) to select it and open its
 //! card; i opens or closes the card; ↑/↓, k/j, tab, the mouse wheel select
@@ -53,6 +59,7 @@
 mod actors;
 mod cast;
 mod format;
+mod limits;
 mod scan;
 mod scene;
 mod ui;
@@ -83,7 +90,7 @@ use ratatui::{
     buffer::{Buffer, CellDiffOption},
     crossterm::{
         cursor::Show,
-        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEventKind},
+        event::{self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEventKind},
         execute,
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode},
     },
@@ -118,16 +125,19 @@ const USAGE: &str = "usage: office [flags] [OFFICE.png]
                (default $XDG_CONFIG_HOME/claude-monitor/sprites, else ~/.config/claude-monitor/sprites)
   --character  GIF or PNG for agents the sprites give none (default assets/character.gif,
                \"\" for a built-in figure)
+  --pet FILE   GIF or PNG of the pet that strolls round the lobby (default assets/pet.gif, \"\" for none)
   --dump       scan once, print the tree, edges and usage as text, exit
   --snapshot OUT.png  scan once, render the office at full size to OUT.png as it stands
                once a visitor has walked in (at most 30 s on), exit
+  --offline    never fetch the accounts' 5 h and 7 day limits (tree, Usage tab)
   --protocol   how to draw (default auto: ask the terminal, else half blocks)
   --font       the terminal's cell size in pixels, for when the terminal does not answer;
                with --protocol, nothing is asked (halfblocks never asks, and assume 10x20)
 
 office: one room for every session. Agents of active sessions (running or active,
-      or not done and active in the last 5 min) sit at desks and in lounges; agents
-      of the others walk in from the entrance now and then, wander, and walk out.
+      or not done and active in the last 5 min) work at desks, then in the meeting
+      room, and rest in the lounges and the kitchen; agents of the others walk in
+      from the entrance now and then, wander, and walk out. A pet strolls round the lobby.
 
 keys: click an agent (visitors too): select it and open its card (name, what it
       did, whom it dealt with); click elsewhere or esc: close it · i open/close the card
@@ -145,8 +155,10 @@ struct Args {
     roots: Vec<PathBuf>,      // empty: ~/.claude/projects and every ~/.claude-*/projects
     since: i64,               // nanoseconds, 0 = all
     sprites: Option<PathBuf>, // None: the default directory
+    pet: Option<PathBuf>,     // None: no pet
     dump: bool,
     snapshot: Option<PathBuf>,
+    offline: bool, // no requests for the accounts' limits
 }
 
 fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -158,8 +170,10 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         roots: Vec::new(),
         since: 24 * 3600 * scan::SEC,
         sprites: None,
+        pet: Some("assets/pet.gif".into()),
         dump: false,
         snapshot: None,
+        offline: false,
     };
     let mut office = None;
     while let Some(a) = it.next() {
@@ -189,8 +203,10 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--root" => args.roots.push(value()?.into()),
             "--since" => args.since = format::parse_duration(&value()?)?,
             "--sprites" => args.sprites = Some(value()?.into()),
+            "--pet" => args.pet = Some(value()?).filter(|p| !p.is_empty()).map(PathBuf::from),
             "--dump" => args.dump = true,
             "--snapshot" => args.snapshot = Some(value()?.into()),
+            "--offline" => args.offline = true,
             _ if name.starts_with('-') && name != "-" => return Err(format!("unknown flag {name}\n\n{USAGE}")),
             _ if office.is_none() => office = Some(a),
             _ => return Err(format!("unexpected argument {a:?}\n\n{USAGE}")),
@@ -314,24 +330,30 @@ impl Write for Counted {
 }
 
 /// The picture as it stands for one layout: the office scaled into the
-/// canvas, and every sprite at this layout's character size.
+/// canvas, every sprite at this layout's character size, and the pet at its own.
 struct Stage {
     layout: Layout,
     base: RgbaImage,
     scaled: Vec<Scaled>,
+    pet: Option<Scaled>,
 }
 
 impl Stage {
     fn new(office: &RgbaImage, layout: Layout, cast: &Cast) -> Stage {
-        let scaled = (0..cast.len()).map(|i| cast.sprite(i).scaled(&layout)).collect();
-        Stage { base: scene::base(office, &layout), layout, scaled }
+        let scaled = (0..cast.len()).map(|i| cast.sprite(i).scaled(&layout, scene::CHARACTER_HEIGHT)).collect();
+        let pet = cast.pet.as_ref().map(|p| p.scaled(&layout, scene::PET_HEIGHT / p.typical_height()));
+        Stage { base: scene::base(office, &layout), layout, scaled, pet }
     }
 
-    /// The office with the app's scene drawn in, t into the animation, and
-    /// what was drawn, keyed by actor and link.
+    /// The office with the pet and the app's scene drawn in, t into the
+    /// animation, and what was drawn, keyed by actor and link (and PET).
     fn compose(&self, office: (u32, u32), app: &App, cast: &Cast, t: Duration) -> (RgbaImage, HashMap<String, Item>) {
         let mut img = self.base.clone();
-        let items = actors::paint(&mut img, &self.layout, office, &app.scene, &self.scaled, t, |i, t| cast.sprite(i).frame_index(t));
+        // Under everyone: small, it only ever passes them.
+        let pet = (self.pet.as_ref().zip(cast.pet.as_ref()).zip(app.scene.pet))
+            .map(|((s, p), ps)| actors::paint_pet(&mut img, &self.layout, office, s, p.frame_index(t), ps, t.as_secs_f64()));
+        let mut items = actors::paint(&mut img, &self.layout, office, &app.scene, &self.scaled, t, |i, t| cast.sprite(i).frame_index(t));
+        items.extend(pet.map(|it| (actors::PET.to_string(), it)));
         (img, items)
     }
 }
@@ -355,12 +377,21 @@ fn show(out: &mut Counted, office: &RgbaImage, cast: &mut Cast, d: &Display, app
     let mut anchor: Option<(String, Rect)> = None;
     // The card as it stands on the screen.
     let mut on_screen: Option<Buffer> = None;
+    // iTerm2: the image each cell of the picture shows, when the whole
+    // picture was last painted, and whether the next frame paints it again
+    // to make the many one.
+    let (mut pieces, mut whole, mut collapse) = (Pieces::default(), Instant::now(), false);
+    // False after the terminal reports its focus went elsewhere (another
+    // tab or window): no frames until it comes back, past one that leaves
+    // the office in one image.
+    let mut focused = true;
     loop {
         while let Ok(s) = scans.try_recv() {
             app.set_snapshot(s);
         }
         let now = Instant::now();
-        if full || now >= next {
+        if full || (now >= next && (focused || collapse)) {
+            let collapsing = std::mem::take(&mut collapse);
             let size = term.size()?;
             if size != pane {
                 pane = size;
@@ -397,12 +428,22 @@ fn show(out: &mut Counted, office: &RgbaImage, cast: &mut Cast, d: &Display, app
                     // else only the cells of actors and links that changed:
                     // re-sending the whole picture every frame is megabytes a
                     // frame, more than the terminal keeps up with.
+                    let cards = (on_screen.as_ref().map(|w| w.area), card.as_ref().map(|c| c.area));
                     let (patches, blanks) = match &shown {
-                        Some(was) => plan(changed(was, &items, d.font), l.area, on_screen.as_ref().map(|w| w.area), card.as_ref().map(|c| c.area)),
+                        Some(_) if collapsing => plan(vec![CellRect::all(l.area)], l.area, cards.0, cards.1),
+                        Some(was) => plan(changed(was, &items, d.font), l.area, cards.0, cards.1),
                         None => (vec![CellRect::all(l.area)], Vec::new()),
                     };
                     let fresh_card = card.as_ref().filter(|&c| on_screen.as_ref() != Some(c));
                     frame_iterm2(term.backend_mut(), &img, &l, &patches, &blanks, fresh_card, d, shown.is_none())?;
+                    if shown.is_none() {
+                        pieces = Pieces::new(l.area);
+                    }
+                    if shown.is_none() || collapsing {
+                        whole = now;
+                    }
+                    patches.iter().for_each(|&p| pieces.paint(p));
+                    collapse = pieces.live() > MAX_PIECES && now - whole >= WHOLE_EVERY;
                 } else {
                     let key = picture_key(&items);
                     let fresh = encoded.as_ref().is_none_or(|(_, k)| *k != key);
@@ -430,7 +471,9 @@ fn show(out: &mut Counted, office: &RgbaImage, cast: &mut Cast, d: &Display, app
             next = now + TICK.max(now.elapsed());
             full = false;
         }
-        if !event::poll(next.saturating_duration_since(Instant::now()))? {
+        // Out of focus, only the scans are taken, once a second.
+        let wait = if focused || collapse { next.saturating_duration_since(Instant::now()) } else { Duration::from_secs(1) };
+        if !event::poll(wait)? {
             continue;
         }
         // Take every pending event before the next frame, so a drag-resize refits once.
@@ -449,6 +492,17 @@ fn show(out: &mut Counted, office: &RgbaImage, cast: &mut Cast, d: &Display, app
                 }
                 Event::Resize(..) => {
                     full = true;
+                    None
+                }
+                // Hidden or not, a tab out of focus is not looked at: its last
+                // frame leaves the office in one image, which is all the
+                // terminal has to show again when it comes back.
+                Event::FocusLost => {
+                    (focused, collapse, next) = (false, true, Instant::now());
+                    None
+                }
+                Event::FocusGained => {
+                    (focused, next) = (true, Instant::now());
                     None
                 }
                 _ => None,
@@ -684,6 +738,53 @@ impl CellRect {
     }
 }
 
+/// Past this many iTerm2 images with a piece still on the screen, the next
+/// frame paints the whole picture again, one image. Every patch is an image
+/// of its own, and the terminal keeps each whole while a piece of it shows:
+/// a busy office left alone becomes a mosaic of some 750 images, 9 Mpx in
+/// all against 1.6 for the picture. WezTerm keeps 256 images decoded per
+/// window and decodes any other one again, one at a time, whenever it draws
+/// it: when its tab comes back, and each time its texture atlas fills up.
+const MAX_PIECES: usize = 256;
+/// At most one such repaint in this time: while many walk at once, the
+/// pieces pass MAX_PIECES again within a second or two, and the whole
+/// picture is some 4 MB against half a megabyte for a frame of patches.
+const WHOLE_EVERY: Duration = Duration::from_secs(10);
+
+/// Which iTerm2 image, numbered as sent, each cell of the picture shows.
+#[derive(Default)]
+struct Pieces {
+    width: u16,
+    cells: Vec<u32>,
+    sent: u32,
+}
+
+impl Pieces {
+    /// The picture's cells hold nothing yet.
+    fn new(area: Rect) -> Pieces {
+        Pieces { width: area.width, cells: vec![0; usize::from(area.width) * usize::from(area.height)], sent: 0 }
+    }
+
+    /// The cells p (relative to the picture) now show one new image.
+    fn paint(&mut self, p: CellRect) {
+        self.sent = self.sent.wrapping_add(1).max(1);
+        let w = usize::from(self.width);
+        for y in usize::from(p.y0)..usize::from(p.y1) {
+            let row = self.cells.get_mut(y * w..(y + 1) * w).unwrap_or_default();
+            let (x0, x1) = (usize::from(p.x0).min(row.len()), usize::from(p.x1).min(row.len()));
+            row[x0..x1].fill(self.sent);
+        }
+    }
+
+    /// How many images have a piece on the screen.
+    fn live(&self) -> usize {
+        let mut ids: Vec<u32> = self.cells.iter().copied().filter(|&i| i > 0).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
+    }
+}
+
 /// Draws the cells `patch` of canvas img with the iTerm2 protocol: the cells
 /// are erased (dropping the image pieces they held), then one PNG of exactly
 /// those cells is placed over them, sized in cells. With `clear` the screen is
@@ -718,12 +819,15 @@ fn paint_iterm2(out: &mut impl Write, img: &RgbaImage, l: &Layout, patch: CellRe
 
 /// Sends one iTerm2 frame of the office in a single write: the blanks, the
 /// patches of img (with `clear`, a full repaint led by clearing the screen),
-/// then the card if it changed. A frame sent piece by piece lets the terminal
-/// show the cells erased for a patch before its image lands, a flicker that
-/// grows with every actor on the move.
+/// then the card if it changed, between the begin and end of a synchronized
+/// update (DECSET 2026). One write is not enough on its own: the terminal
+/// reads a frame of hundreds of kilobytes in pieces and may show the screen
+/// between two, with the cells erased for a patch before its image lands, a
+/// flicker that grows with every actor on the move.
 #[allow(clippy::too_many_arguments)]
 fn frame_iterm2(out: &mut impl Write, img: &RgbaImage, l: &Layout, patches: &[CellRect], blanks: &[CellRect], card: Option<&Buffer>, d: &Display, clear: bool) -> io::Result<()> {
-    let mut frame = Vec::new();
+    const BEGIN: &[u8] = b"\x1b[?2026h";
+    let mut frame = BEGIN.to_vec();
     for &b in blanks {
         blank(&mut frame, b)?;
     }
@@ -733,9 +837,10 @@ fn frame_iterm2(out: &mut impl Write, img: &RgbaImage, l: &Layout, patches: &[Ce
     if let Some(c) = card {
         write_card(&mut CrosstermBackend::new(&mut frame), c)?;
     }
-    if frame.is_empty() {
+    if frame.len() == BEGIN.len() {
         return Ok(());
     }
+    frame.extend_from_slice(b"\x1b[?2026l");
     out.write_all(&frame)?;
     out.flush()
 }
@@ -754,7 +859,8 @@ fn home() -> PathBuf {
 }
 
 /// The sprites, from --sprites or $XDG_CONFIG_HOME/claude-monitor/sprites
-/// (else ~/.config/claude-monitor/sprites), with --character for the rest.
+/// (else ~/.config/claude-monitor/sprites), with --character for the rest,
+/// and the --pet. A pet that does not load is left out, with a note.
 fn load_cast(args: &Args) -> Result<Cast, String> {
     let fallback = match &args.character {
         Some(p) => Some(Sprite::load(p).map_err(|e| format!("character {}: {e}", p.display()))?),
@@ -764,7 +870,17 @@ fn load_cast(args: &Args) -> Result<Cast, String> {
         let base = env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()).map_or_else(|| home().join(".config"), PathBuf::from);
         base.join("claude-monitor").join("sprites")
     });
-    Ok(Cast::load(&dir, args.sprites.is_some(), fallback))
+    let mut cast = Cast::load(&dir, args.sprites.is_some(), fallback);
+    if let Some(p) = &args.pet {
+        match Sprite::load(p) {
+            Ok(s) => cast.pet = Some(s),
+            Err(e) => {
+                let note = format!("pet: {}: {e}; no pet", p.display());
+                cast.note = if cast.note.is_empty() { note } else { format!("{}\n{note}", cast.note) };
+            }
+        }
+    }
+    Ok(cast)
 }
 
 fn now() -> i64 {
@@ -812,13 +928,14 @@ fn snapshot(args: &Args, out: &Path) -> Result<String, Box<dyn Error>> {
     let sc = &app.scene;
     let visitors: Vec<&str> = sc.actors.iter().filter(|a| a.visitor).map(|a| a.id.as_str()).collect();
     let mut s = format!(
-        "office: wrote {} ({w}x{h}) {:.1} s on: {} active sessions, {} agents drawn, visitors {visitors:?}, {} links, {} left",
+        "office: wrote {} ({w}x{h}) {:.1} s on: {} active sessions, {} agents drawn, visitors {visitors:?}, {} links, {} left, {}",
         out.display(),
         t.as_secs_f64(),
         sc.sessions,
         sc.actors.len(),
         sc.links.len(),
-        sc.left
+        sc.left,
+        if cast.pet.is_some() { "a pet" } else { "no pet" }
     );
     if !cast.note.is_empty() {
         s += &format!("\n{}", cast.note);
@@ -849,7 +966,7 @@ fn scanner(roots: Vec<scan::Root>, since: i64) -> (Receiver<Snapshot>, Sender<()
 
 fn restore(out: &mut impl Write) {
     let _ = disable_raw_mode();
-    let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen, Show);
+    let _ = execute!(out, DisableFocusChange, DisableMouseCapture, LeaveAlternateScreen, Show);
 }
 
 fn run(args: Args) -> Result<String, Box<dyn Error>> {
@@ -862,6 +979,8 @@ fn run(args: Args) -> Result<String, Box<dyn Error>> {
     let office = image::open(&args.office).map_err(|e| format!("{}: {e}", args.office.display()))?.to_rgba8();
     let mut cast = load_cast(&args)?;
     let mut app = App::new(args.since, now() as u64);
+    // Only here, never for --dump or --snapshot; nothing is fetched until the Usage tab shows.
+    app.limits = Some(limits::Limits::new(limits::accounts(&home()), args.offline));
     let (scans, rescan) = scanner(roots(&args), args.since);
 
     let mut out = Counted::new().map_err(|e| format!("OFFICE_VIEW_TRACE: {e}"))?;
@@ -874,7 +993,7 @@ fn run(args: Args) -> Result<String, Box<dyn Error>> {
     }));
     // Clicks are reported only once detection has had its answers, so none is taken for one.
     let shown = Display::detect(&args).and_then(|d| {
-        execute!(out, EnableMouseCapture)?;
+        execute!(out, EnableMouseCapture, EnableFocusChange)?;
         Ok((show(&mut out, &office, &mut cast, &d, &mut app, &scans, &rescan)?, d))
     });
     restore(&mut out);
@@ -1180,17 +1299,45 @@ mod tests {
         let s = String::from_utf8_lossy(&out.bytes);
         assert_eq!(s.matches("\x1b]1337;File=").count(), patches.len());
         assert!(!s.contains("\x1b[6n") && !s.contains("\x1b[2J"), "a patch frame neither asks nor clears");
+        // The terminal shows none of it until all of it is in.
+        assert!(s.starts_with("\x1b[?2026h") && s.ends_with("\x1b[?2026l"), "a frame is one synchronized update");
+        assert_eq!((s.matches("\x1b[?2026h").count(), s.matches("\x1b[?2026l").count()), (1, 1));
 
         // A full repaint: the clear leads the same single write.
         let mut out = Calls::default();
         frame_iterm2(&mut out, &img, &l, &[CellRect::all(l.area)], &[], None, &d, true).unwrap();
         assert_eq!((out.writes, out.flushes), (1, 1));
-        assert!(out.bytes.starts_with(b"\x1b[2J"));
+        assert!(out.bytes.starts_with(b"\x1b[?2026h\x1b[2J") && out.bytes.ends_with(b"\x1b[?2026l"));
 
         // Nothing changed: nothing sent.
         let mut out = Calls::default();
         frame_iterm2(&mut out, &img, &l, &[], &[], None, &d, false).unwrap();
         assert_eq!((out.writes, out.flushes), (0, 0));
+    }
+
+    /// Pieces counts the images with a piece on the screen: patches add
+    /// theirs, cover others whole or in part, and the whole picture painted
+    /// again leaves one.
+    #[test]
+    fn pieces_count_the_images_left_on_the_screen() {
+        let area = Rect::new(5, 2, 40, 20);
+        let mut p = Pieces::new(area);
+        assert_eq!(p.live(), 0);
+        p.paint(CellRect::all(area));
+        assert_eq!(p.live(), 1);
+        for y in 0..10 {
+            for x in 0..30 {
+                p.paint(cr(x, y, x + 1, y + 1));
+            }
+        }
+        assert_eq!(p.live(), 301, "300 one-cell patches on the picture");
+        assert!(p.live() > MAX_PIECES);
+        p.paint(cr(0, 0, 30, 5));
+        assert_eq!(p.live(), 1 + 150 + 1, "a patch over half of them");
+        p.paint(cr(35, 15, 50, 30));
+        assert_eq!(p.live(), 153, "a patch past the picture is cut to it");
+        p.paint(CellRect::all(area));
+        assert_eq!(p.live(), 1);
     }
 
     /// A click lands on the agent whose cells hold it, the front one where
@@ -1297,6 +1444,57 @@ mod tests {
         assert_eq!(plan(Vec::new(), l.area, Some(cards[1]), Some(cards[1])), (Vec::new(), Vec::new()));
     }
 
+    /// The pet: drawn in the lobby by default (assets/pet.gif, from the
+    /// crate root where tests run), its own item, repainted only when its
+    /// frame or where it stands changes, never clickable, no bigger on the
+    /// screen than a typing agent. `--pet ""` and a broken file leave it
+    /// out, the latter with a note, and neither fails.
+    #[test]
+    fn a_pet_strolls_the_lobby_unless_told_not_to() {
+        let font = (10, 20);
+        let l = scene::fit((1254, 1254), 140, 40, font, false);
+        let flags = |extra: &[&str]| parse_args(["--sprites", "/nonexistent"].iter().chain(extra).map(|s| s.to_string())).unwrap();
+        let (mut app, _, office) = busy();
+        let mut cast = load_cast(&flags(&[])).unwrap();
+        assert!(cast.pet.is_some() && !cast.note.contains("pet"), "{}", cast.note);
+        app.refresh_scene(NOW, 0.0, &mut cast);
+        let stage = Stage::new(&office, l, &cast);
+        let (_, items) = stage.compose((1254, 1254), &app, &cast, Duration::ZERO);
+        let [[x0, y0, x1, y1]] = items[actors::PET].rects[..] else { panic!("one rect") };
+        // Its feet in the lobby (x 285..870, y 120..445 of the 1254 px picture), its sprite over them.
+        let ps = app.scene.pet.expect("walked once");
+        assert!((285.0..870.0).contains(&(ps.p.x * 1254.0)) && (120.0..445.0).contains(&(ps.p.y * 1254.0)), "{ps:?}");
+        let (fx, fy) = l.px(ps.p);
+        assert!((f64::from(x0)..f64::from(x1)).contains(&fx) && (f64::from(y0)..f64::from(y1)).contains(&fy), "{:?} {ps:?}", items[actors::PET].rects);
+        let cells = |it: &Item| cells(&it.rects.iter().map(|&r| CellRect::covering(r, font)).collect::<Vec<_>>()).len();
+        let typing = app.scene.actors.iter().filter(|a| a.anim == actors::Anim::Typing).map(|a| cells(&items[&a.id])).min().unwrap();
+        assert!(cells(&items[actors::PET]) <= typing, "the pet covers {} cells, a typing agent {typing}", cells(&items[actors::PET]));
+        let mid = |a: u32, b: u32, o: u16, f: u16| o + u16::try_from((a + b) / 2).unwrap() / f;
+        assert_eq!(hit(&app.scene, &items, &l, mid(x0, x1, l.area.x, font.0), mid(y0, y1, l.area.y, font.1)), None, "a click on the pet selects nobody");
+        // Over ten seconds its key changes exactly when its frame or where it
+        // stands does, and it walks some of them.
+        let frame: Vec<usize> = (0..=100).map(|i| cast.pet.as_ref().unwrap().frame_index(TICK * i)).collect();
+        let (mut was, mut pose, mut walked) = (items, ps, 0);
+        for i in 1..=100 {
+            let t = TICK * i;
+            app.refresh_scene(NOW, t.as_secs_f64(), &mut cast);
+            let (_, items) = stage.compose((1254, 1254), &app, &cast, t);
+            let now = app.scene.pet.expect("always there");
+            let turned = frame[i as usize] != frame[i as usize - 1];
+            assert_eq!(items[actors::PET].key != was[actors::PET].key, turned || now != pose, "frame {i}");
+            walked += usize::from(now.moving);
+            (was, pose) = (items, now);
+        }
+        assert!(walked > 10, "walked {walked} frames of 100");
+
+        for (extra, note) in [(&["--pet", ""][..], ""), (&["--pet", "/nonexistent/pet.gif"][..], "pet: /nonexistent/pet.gif: ")] {
+            let cast = load_cast(&flags(extra)).unwrap();
+            assert!(cast.pet.is_none() && cast.note.contains(note) && cast.note.contains("pet") != note.is_empty(), "{extra:?}: {}", cast.note);
+            let (_, items) = Stage::new(&office, l, &cast).compose((1254, 1254), &app, &cast, Duration::ZERO);
+            assert!(!items.contains_key(actors::PET), "{extra:?}");
+        }
+    }
+
     /// The card goes out as text alone: cursor moves, colors and its
     /// characters, every cell of it, ending with the colors reset.
     #[test]
@@ -1340,6 +1538,9 @@ mod tests {
         let a = parse_args(["--root", "/a", "--root=/b", "--since", "2h", "--dump", "pic.png"].map(String::from).into_iter()).unwrap();
         assert_eq!((a.roots.len(), a.since, a.dump), (2, 7200 * scan::SEC, true));
         assert_eq!(a.office, PathBuf::from("pic.png"));
+        assert_eq!(a.pet, Some(PathBuf::from("assets/pet.gif")), "a pet by default");
+        assert_eq!(parse_args(["--pet", ""].map(String::from).into_iter()).unwrap().pet, None);
+        assert_eq!(parse_args(["--pet=cat.png"].map(String::from).into_iter()).unwrap().pet, Some(PathBuf::from("cat.png")));
         assert!(parse_args(["--since", "2"].map(String::from).into_iter()).is_err());
         // One room: there is no session to pick.
         assert!(parse_args(["--session", "s"].map(String::from).into_iter()).is_err_and(|e| e.starts_with("unknown flag --session")));

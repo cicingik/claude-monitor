@@ -6,12 +6,15 @@ tokens each one used.
 
 It draws one pixel-art office (`assets/office.png`) for every session at once, sent to
 the terminal as images (iTerm2, kitty or sixel; half blocks otherwise). Agents
-are animated characters at desks, in the lounge, or walking through. Click one
+are animated characters at desks, in the meeting room, in the lounges and the
+kitchen, or walking through; a pet strolls round the lobby. Click one
 to see what it did. Press `v` for the tree and tabs.
 
 It is read-only. It reads transcript files under `~/.claude/projects` and every
-`~/.claude-*/projects` (so the sessions of several accounts show together), and
-never calls Claude or any network service.
+`~/.claude-*/projects` (so the sessions of several accounts show together). Its
+only network call is the one that shows each account's plan limits in the
+tree's Usage tab (see [Accounts](#accounts)), made once that tab is shown;
+`--offline` turns it off. It never calls Claude.
 
 The app is the Rust crate at the repo root; its pictures are in `assets/`.
 
@@ -23,7 +26,7 @@ cross-build of archives for other systems with `build.sh`.
 ### From a release archive
 
 A release archive is one of the files `build.sh` writes to `dist/`. Each holds
-one folder with the binary, `assets/` (`office.png` and `character.gif`) and this README.
+one folder with the binary, `assets/` (`office.png`, `character.gif` and `pet.gif`) and this README.
 Pick the archive for your system:
 
 | System               | Archive                                              |
@@ -60,14 +63,15 @@ Pick the archive for your system:
    ```
 
    `No such xattr` means there was no mark. That is fine.
-5. Run it from the folder, so it finds `assets/office.png` and `assets/character.gif`:
+5. Run it from the folder, so it finds `assets/office.png`, `assets/character.gif`
+   and `assets/pet.gif`:
 
    ```sh
    ./office
    ```
 
 6. Optional: to run it from any directory, keep the folder in one place and put
-   a wrapper on your `PATH` that passes the picture and the character:
+   a wrapper on your `PATH` that passes the picture, the character and the pet:
 
    ```sh
    mkdir -p ~/.local/share ~/.local/bin
@@ -75,7 +79,7 @@ Pick the archive for your system:
    cat > ~/.local/bin/office <<'EOF'
    #!/bin/sh
    d="$HOME/.local/share/office"
-   exec "$d/office" "$d/assets/office.png" --character "$d/assets/character.gif" "$@"
+   exec "$d/office" "$d/assets/office.png" --character "$d/assets/character.gif" --pet "$d/assets/pet.gif" "$@"
    EOF
    chmod +x ~/.local/bin/office
    ```
@@ -133,6 +137,10 @@ transcripts in the WSL home. Pass that with
 
 `--protocol auto` (the default) asks the terminal. Force one with
 `--protocol iterm2`, `kitty`, `sixel` or `halfblocks`.
+
+When the terminal reports that office's tab or window lost focus (WezTerm,
+kitty, iTerm2 and most others do), office stops drawing until focus comes back.
+It keeps scanning, so it catches up at once.
 
 ### From source
 
@@ -201,9 +209,10 @@ macOS binaries are not signed.
 ./target/release/office --snapshot room.png   # render the room to a PNG, exit
 ```
 
-`assets/office.png` (the room) and `assets/character.gif` (the default character)
-are read relative to the working directory. Run from the repo root (or the extracted archive
-folder), or pass the picture as the argument and `--character FILE`.
+`assets/office.png` (the room), `assets/character.gif` (the default character)
+and `assets/pet.gif` (the pet) are read relative to the working directory. Run
+from the repo root (or the extracted archive folder), or pass the picture as the
+argument, `--character FILE` and `--pet FILE`.
 
 On Windows WezTerm from WSL, start it in a WezTerm window of its own:
 
@@ -222,8 +231,10 @@ many times a second.
 | `--since DUR`   | `24h`                      | Only sessions whose transcript changed within DUR (`0` = all) |
 | `--sprites DIR` | `$XDG_CONFIG_HOME/claude-monitor/sprites` (else `~/.config/claude-monitor/sprites`) | Custom character GIF/PNG files, see [Custom characters](#custom-characters) |
 | `--character F` | `assets/character.gif`     | Character for agents with no sprite; `""` for a built-in figure |
+| `--pet F`       | `assets/pet.gif`           | GIF or PNG of the pet that strolls round the lobby; `""` for no pet. A missing or broken file means no pet and a note at exit, never a failure |
 | `--dump`        | off                        | Scan once, print the tree, edges and usage as text, exit |
 | `--snapshot OUT.png` | off                   | Scan once, render the room once a visitor has walked in (at most 30 s on), exit |
+| `--offline`     | off                        | Never fetch the accounts' limits; the Usage tab's Accounts say `offline` |
 | `--protocol P`  | `auto`                     | `auto`, `iterm2`, `kitty`, `sixel` or `halfblocks`; `auto` asks the terminal, else half blocks |
 | `--font WxH`    | asked from the terminal    | Cell size in pixels when the terminal does not answer; with `--protocol`, nothing is asked (default `10x20`) |
 
@@ -234,15 +245,34 @@ FILE, for debugging the image stream.
 
 All sessions share one office. There are no session keys.
 
-- **Residents:** agents of active sessions take desks and lounge seats. A
+- **Rooms:** the office has work places and rest places.
+  - *Work:* the manager's desk (right), the 3×3 desk grid of the open plan, and
+    seven chairs round the meeting room's table (top right), taken once the nine
+    desks are full.
+  - *Rest:* the top-left lounge, the kitchen and dining table (left), the
+    bottom-right lounge, and the sofa in the manager's office. Seats fill one
+    room after another, so three idle agents sit in three rooms, not on one sofa.
+  - The lobby, the washroom and the open plan's aisles are for walking and
+    waiting. The copy room has no door on the picture, so nobody goes in.
+- **Residents:** agents of active sessions take work and rest places. A
   session is active when it has an agent that is running or active, or not done
   and busy in the last 5 minutes. The most recently active lead gets the
-  manager's desk; other leads and subagents take the desk grid. Running and
-  active agents sit at desks, idle ones in the lounge, done ones are dimmed with
-  a `✓` and walk out after 10 minutes. Residents beyond the free places walk
-  around as visitors instead of overlapping.
+  manager's desk; other leads and subagents take the desk grid, then the meeting
+  room. Running and active agents work, idle ones rest and doze (`z`), done ones
+  rest dimmed with a `✓` and walk out after 10 minutes. Residents beyond the
+  free places walk around as visitors instead of overlapping.
 - **Visitors:** agents of inactive sessions walk in from the entrance now and
-  then, a few at a time, wander a short route, and walk out again.
+  then, a few at a time, wander a short route through any room with a door
+  (lounges, kitchen, washroom, meeting room, manager's office, lobby and open
+  plan), and walk out again.
+- **Pet:** a pet (`assets/pet.gif`, or `--pet FILE`) strolls round the lobby
+  for good: along the aisles round the reception desk and to the lounge's and
+  meeting room's doors, pausing 1 to 4 seconds at each stop, at half a
+  visitor's pace. It never leaves the lobby, never goes to the entrance, and
+  steps on when an agent stops where it waits. It is not an agent: it cannot be
+  clicked or selected and has no links. It is sized so its usual frame is
+  about 0.6 of a character's height (a jump in the GIF can reach higher).
+  `--pet ""` leaves it out.
 - **Links:** a spawn, message or handback younger than 90 seconds is drawn as a
   still dotted line between the two agents, with a letter travelling along it.
   Visitors have no links.
@@ -253,7 +283,7 @@ The office shows no text except the card.
 
 | Key                              | Action |
 |----------------------------------|--------|
-| click an agent (visitors too)    | select it and open its card: name, what it did, whom it dealt with |
+| click an agent (visitors too)    | select it and open its card: name, role (session lead, or subagent and its type), what it did, whom it dealt with |
 | click elsewhere, `esc`           | close the card |
 | `i`                              | open or close the card of the selected agent |
 | `↑`/`↓`, `k`/`j`, `tab`, wheel   | select the previous or next agent |
@@ -285,8 +315,9 @@ this repository: `sprites/` is in `.gitignore`.
 
 ## Art and licensing
 
-The room is `assets/office.png` and the default character is
-`assets/character.gif`, both read at run time relative to the working directory. Custom sprites are loaded only
+The room is `assets/office.png`, the default character is
+`assets/character.gif` and the pet is `assets/pet.gif`, all read at run time
+relative to the working directory. Custom sprites are loaded only
 from your local directory at run time and are never copied anywhere; only use
 art you have the right to use.
 
@@ -304,8 +335,36 @@ Press `v` to switch between the office and the tree.
   events, newest first. While it runs, `now:` shows the pending tool call.
 - **Tab 2 Interactions:** edges into and out of the selected agent, plus an
   ASCII graph of its session with spawn labels, messages and handbacks.
-- **Tab 3 Usage:** a token bar per agent in the session, totals by model and
-  the session total.
+- **Tab 3 Usage:** first the Accounts (below), then a token bar per agent in
+  the session, totals by model and the session total.
+
+### Accounts
+
+The Usage tab starts with every account's plan limits, as bars like the
+session's:
+
+```
+Accounts  fetched 01:21:43
+default               token expired, open claude with this account
+personal 5h           ███████████████████████ 100%  resets 02:00
+         7d           ████████░░░░░░░░░░░░░░░  39%  resets Thu 18:00
+work 5h               ███████████░░░░░░░░░░░░  52%  resets 03:40
+     7d               ██░░░░░░░░░░░░░░░░░░░░░  12%  resets Sun 05:00
+```
+
+- An account is `~/.claude` (`default`) or a `~/.claude-<name>` directory
+  (`<name>`) holding `.credentials.json` (`%USERPROFILE%` on Windows).
+- The numbers come from `GET https://api.anthropic.com/api/oauth/usage` with
+  the account's OAuth access token (`five_hour` and `seven_day`:
+  `utilization` in percent and `resets_at`), the request Claude Code's own
+  usage display makes. Reset times are local.
+- The token is only read: never refreshed, written, shown or logged. An
+  expired one is not sent; log in again by opening `claude` with that account.
+- Fetching starts the first time the Usage tab shows, in the background, then
+  runs once a minute per account, and again on `r` (never twice within 10 s).
+  `--dump` and `--snapshot` never fetch, nor does `--offline`.
+- A failure is one line instead of the bars: `offline`, `timeout`, `HTTP 429`,
+  `token rejected (HTTP 401)`, and so on.
 
 Status glyphs:
 
@@ -331,7 +390,8 @@ Status glyphs:
 ## Data sources
 
 All paths are under `--root` (default `~/.claude/projects` and every
-`~/.claude-*/projects`). Nothing else under `~/.claude*` is read.
+`~/.claude-*/projects`). Nothing else under `~/.claude*` is read, except each
+account's `.credentials.json` for the [Accounts](#accounts) limits.
 
 - `<project>/<sessionId>.jsonl`: the main session, one JSON object per line.
   The project directory is the session cwd with `/` replaced by `-`; the UI

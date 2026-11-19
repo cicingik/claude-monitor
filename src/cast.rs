@@ -11,8 +11,11 @@ use image::RgbaImage;
 use crate::scene::Sprite;
 
 pub struct Cast {
-    /// One line for the help bar, "" when there is nothing to say.
+    /// What to say about the sprites and the pet when the run ends, "" when
+    /// there is nothing to say.
     pub note: String,
+    /// The office pet, strolling round the lobby: not an agent, never picked.
+    pub pet: Option<Sprite>,
     files: Vec<(String, Sprite)>, // lower-case file stem, sorted
     fallback: Sprite,
     seen: HashSet<String>, // lower-case agent types seen so far
@@ -23,7 +26,7 @@ impl Cast {
     /// are skipped and summed up in the note. `explicit` says the user named
     /// dir, so a missing or empty one deserves a note.
     pub fn load(dir: &Path, explicit: bool, fallback: Option<Sprite>) -> Cast {
-        let mut c = Cast { note: String::new(), files: Vec::new(), fallback: fallback.unwrap_or_else(builtin), seen: HashSet::new() };
+        let mut c = Cast { note: String::new(), pet: None, files: Vec::new(), fallback: fallback.unwrap_or_else(builtin), seen: HashSet::new() };
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => {

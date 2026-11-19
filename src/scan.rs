@@ -647,9 +647,9 @@ impl FileState {
             match s(c, "type") {
                 "tool_use" => {
                     let (name, input) = (s(c, "name"), c.get("input").unwrap_or(&Value::Null));
-                    let sum = tool_summary(name, input);
+                    let sum = tool_summary(name, input, 50);
                     self.last_tool_id = s(c, "id").to_string();
-                    self.last_tool = sum.clone();
+                    self.last_tool = tool_summary(name, input, NOW_MAX);
                     self.add_event(Event { at, kind: "tool_use", tool: name.into(), summary: sum });
                     self.record_interaction(at, name, s(c, "id"), input);
                 }
@@ -762,8 +762,11 @@ fn agent_message_from(t: &str) -> Option<&str> {
     None
 }
 
-/// "Tool: short arg" from a tool_use input.
-fn tool_summary(name: &str, input: &Value) -> String {
+/// How much of the running tool call the card's "now:" may show (3 lines).
+const NOW_MAX: usize = 150;
+
+/// "Tool: arg" from a tool_use input, the arg's lines joined and cut to max.
+fn tool_summary(name: &str, input: &Value, max: usize) -> String {
     let arg = match name {
         "Bash" => s(input, "command").to_string(),
         "Read" | "Write" | "Edit" | "NotebookEdit" => short_path(s(input, "file_path")),
@@ -779,7 +782,7 @@ fn tool_summary(name: &str, input: &Value) -> String {
             .unwrap_or("")
             .to_string(),
     };
-    let arg = one_line(&arg, 50);
+    let arg = truncate(&arg.split_whitespace().collect::<Vec<_>>().join(" "), max);
     if arg.is_empty() { name.to_string() } else { format!("{name}: {arg}") }
 }
 
@@ -881,8 +884,8 @@ mod tests {
         assert_eq!(truncate("abcdef", 4), "abc…");
         assert_eq!(one_line("\n  first line \nsecond", 60), "first line");
         let v: Value = serde_json::from_str(r#"{"description":"look","subagent_type":"Explore"}"#).unwrap();
-        assert_eq!(tool_summary("Agent", &v), "Agent: look (Explore)");
-        assert_eq!(tool_summary("Grep", &Value::Null), "Grep");
+        assert_eq!(tool_summary("Agent", &v, 50), "Agent: look (Explore)");
+        assert_eq!(tool_summary("Grep", &Value::Null, 50), "Grep");
     }
 
     #[test]
@@ -946,7 +949,7 @@ mod tests {
         write(&main, &[r#"{"type":"assistant","timestamp":"2026-01-01T10:02:00Z","message":{"id":"m2","model":"claude-opus-4-5","usage":{"output_tokens":1},"content":[{"type":"tool_use","id":"tu3","name":"Bash","input":{"command":"ls -la\nmore"}}]}}"#]);
         let snap = s.scan(now);
         let root = &snap.by_id["s1"];
-        assert_eq!((root.turns, root.usage.total(), root.last_tool.as_str()), (2, 16, "Bash: ls -la"));
+        assert_eq!((root.turns, root.usage.total(), root.last_tool.as_str()), (2, 16, "Bash: ls -la more"));
 
         // The same session under a second root keeps unique ids.
         let copy = dir.join("other").join(".claude-work").join("projects").join("-home-me-proj");

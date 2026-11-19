@@ -1,5 +1,6 @@
 //! The keys of the office view and the card of its selected agent, and the
-//! tree view with its Activity, Interactions and Usage tabs.
+//! tree view with its Activity, Interactions and Usage tabs; the Usage tab
+//! starts with every account's 5-hour and 7-day limits.
 //! The office view is the picture alone; its only text is
 //! the card, while it is open.
 
@@ -17,12 +18,15 @@ use ratatui::{
 
 use crate::{
     actors::{self, Scene, Walker, link_rgb},
-    cast::Cast,
-    format::{age, agent_type, clock, fit, hour_minute, human_tokens, label, short_duration, short_id, short_model, usage_detail},
-    scan::{Agent, EdgeKind, Kind, Snapshot, Status, Usage, truncate},
+    cast::{Cast, fnv32a},
+    format::{age, agent_type, clock, fit, hour_minute, human_tokens, label, local, short_duration, short_id, short_model, usage_detail},
+    limits::{AccountUsage, Limit, Limits},
+    scan::{Agent, EdgeKind, Kind, Snapshot, Status, Usage, days_from_civil, truncate},
 };
 
 const TABS: [&str; 3] = ["Activity", "Interactions", "Usage"];
+/// The widest a card gets, border and padding included.
+const CARD_W: u16 = 56;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
@@ -55,7 +59,24 @@ pub struct App {
     pub card: bool,    // the selected agent's card is open
     pub scene: Scene,
     walker: Walker,
+    // The accounts' limits on the Usage tab; None shows no Accounts section.
+    pub limits: Option<Limits>,
+    // What the card calls each agent instead of its id: an animal, given
+    // when a scan first shows the agent, never changed, never shared.
+    animals: HashMap<String, String>,
 }
+
+/// The names agents go by on the card.
+const ANIMALS: [&str; 96] = [
+    "otter", "heron", "badger", "falcon", "lynx", "panda", "koala", "gecko", "bison", "moose", "walrus", "beaver",
+    "ferret", "marmot", "puffin", "toucan", "parrot", "pelican", "penguin", "flamingo", "ostrich", "kiwi", "raven", "owl",
+    "hawk", "eagle", "swan", "goose", "sparrow", "finch", "wren", "magpie", "stork", "crane", "ibis", "lemur",
+    "gibbon", "baboon", "tapir", "okapi", "zebra", "giraffe", "hippo", "rhino", "camel", "llama", "alpaca", "yak",
+    "ibex", "gazelle", "impala", "elk", "fox", "wolf", "coyote", "jackal", "hyena", "cheetah", "leopard", "jaguar",
+    "tiger", "lion", "puma", "ocelot", "bobcat", "mink", "stoat", "weasel", "skunk", "raccoon", "wombat", "platypus",
+    "armadillo", "sloth", "hedgehog", "mole", "hare", "squirrel", "chipmunk", "hamster", "seal", "orca", "dolphin", "whale",
+    "shark", "octopus", "squid", "crab", "lobster", "turtle", "iguana", "newt", "frog", "salmon", "bee", "beetle",
+];
 
 fn header_style() -> Style {
     Style::new().fg(Color::Indexed(212)).add_modifier(Modifier::BOLD)
@@ -119,10 +140,26 @@ impl App {
             card: false,
             scene: Scene::default(),
             walker: Walker::new(seed),
+            limits: None,
+            animals: HashMap::new(),
         }
     }
 
     pub fn set_snapshot(&mut self, snap: Snapshot) {
+        let mut new: Vec<&String> = snap.by_id.keys().filter(|id| !self.animals.contains_key(*id)).collect();
+        new.sort();
+        for id in new {
+            // The animal the id hashes to, else the next one free; past the
+            // last, the same again with a number.
+            let taken: HashSet<&str> = self.animals.values().map(String::as_str).collect();
+            let at = fnv32a(id) as usize;
+            let name = (1..)
+                .flat_map(|round| (0..ANIMALS.len()).map(move |i| (round, ANIMALS[(at + i) % ANIMALS.len()])))
+                .map(|(round, a)| if round == 1 { a.to_string() } else { format!("{a} {round}") })
+                .find(|n| !taken.contains(n.as_str()))
+                .expect("names never run out");
+            self.animals.insert(id.clone(), name);
+        }
         self.snap = Some(snap);
         self.sync_cursor();
     }
@@ -160,6 +197,9 @@ impl App {
             return Action::Quit;
         }
         if k.code == KeyCode::Char('r') {
+            if let Some(l) = &self.limits {
+                l.refresh();
+            }
             return Action::Rescan;
         }
         match self.view {
@@ -386,6 +426,9 @@ impl App {
             tabs.push(Span::styled(format!(" {} {n} ", i + 1), style));
         }
         let mut out = vec![Line::from(tabs), Line::styled("─".repeat(w), faint())];
+        if self.tab == 2 {
+            out.extend(self.accounts(w));
+        }
         let (Some(snap), Some(a)) = (&self.snap, self.agent(&self.selected)) else {
             out.push(Line::styled("nothing selected", faint()));
             return out;
@@ -433,28 +476,63 @@ impl App {
         }
     }
 
-    /// A short name for an agent on the card.
+    /// The animal an agent goes by on the card (its short id, for one no scan showed).
+    fn animal<'a>(&'a self, id: &'a str) -> &'a str {
+        self.animals.get(id).map_or_else(|| short_id(id), String::as_str)
+    }
+
+    /// Another agent on the card: "lead" for a session, else its animal.
     fn who(&self, id: &str) -> String {
         match self.agent(id) {
             Some(a) if a.kind == Kind::Session => "lead".into(),
-            Some(a) if !a.title.is_empty() => truncate(&a.title, 18),
-            _ => short_id(id).into(),
+            _ => self.animal(id).into(),
         }
     }
 
-    /// The selected agent's card in at most `rows` lines: who it is, what it
-    /// did and whom it dealt with, newest first, up to 8 of each.
+    /// s with each word that is an agent's id, or 8 or more characters of
+    /// its start (cut short, as in "SendMessage: to a5582ca8…"), given as who
+    /// it is.
+    fn without_ids(&self, s: &str) -> String {
+        let named = |w: &str| {
+            let bare = w.trim_end_matches('…');
+            let id = self.animals.keys().find(|id| bare.len() >= 8 && id.starts_with(bare))?;
+            Some(self.who(id))
+        };
+        s.split(' ').map(|w| named(w).unwrap_or_else(|| w.to_string())).collect::<Vec<_>>().join(" ")
+    }
+
+    /// The selected agent's card in at most `rows` lines: who it is (its
+    /// role), what it did and whom it dealt with,
+    /// newest first: the last 3 things it did, up to 8 dealings. No tokens: those are in the tree.
     pub fn card_lines(&self, rows: usize) -> Vec<Line<'static>> {
         let (Some(snap), Some(a)) = (&self.snap, self.agent(&self.focus)) else { return vec![Line::styled("nothing selected", faint())] };
         let now = snap.scanned_at;
+        let role = match a.kind {
+            Kind::Session => "session lead".to_string(),
+            Kind::Subagent if a.agent_type.is_empty() => "subagent".to_string(),
+            Kind::Subagent => format!("subagent · {}", a.agent_type),
+        };
+        // Its animal, then what it is about: a subagent's description, a session's title or project.
+        let name = match (a.kind, a.title.is_empty()) {
+            (Kind::Session, true) => format!("{} ({})", self.animal(&a.id), a.project),
+            (_, true) => self.animal(&a.id).to_string(),
+            (_, false) => format!("{} · {}", self.animal(&a.id), a.title),
+        };
         let mut out = vec![
-            Line::from(vec![glyph(a.status), Span::raw(" "), Span::styled(label(a), bold())]),
-            Line::raw(format!("{} · {} · {}", agent_type(a), short_model(&a.model), a.status.name())),
-            Line::raw(format!("tokens {} · turns {} · last activity {} ago", human_tokens(a.usage.total()), a.turns, age(now, a.last_activity))),
-            Line::styled(usage_detail(a.usage), faint()),
+            Line::from(vec![glyph(a.status), Span::raw(" "), Span::styled(name, bold())]),
+            Line::raw(truncate(&format!("role: {role}"), usize::from(CARD_W) - 4)),
+            Line::raw(format!("{} · {}", short_model(&a.model), a.status.name())),
+            Line::styled(format!("last activity {} ago", age(now, a.last_activity)), faint()),
         ];
         if a.status == Status::Running {
-            out.push(Line::styled(format!("now: {}", a.last_tool), Style::new().fg(status_color(Status::Running)).add_modifier(Modifier::BOLD)));
+            // What it runs now, wrapped over at most 3 lines.
+            let (w, now_style) = (usize::from(CARD_W) - 4, Style::new().fg(status_color(Status::Running)).add_modifier(Modifier::BOLD));
+            let text: Vec<char> = format!("now: {}", self.without_ids(&a.last_tool)).chars().collect();
+            let lines: Vec<String> = text.chunks(w).map(|c| c.iter().collect()).collect();
+            for (i, l) in lines.iter().take(3).enumerate() {
+                let l = if i == 2 && lines.len() > 3 { truncate(&format!("{l}…"), w) } else { l.clone() };
+                out.push(Line::styled(l, now_style));
+            }
         }
         let did: Vec<Line<'static>> = a
             .events
@@ -466,6 +544,7 @@ impl App {
                     "prompt" => format!("prompt: {}", e.summary),
                     _ => e.summary.clone(),
                 };
+                let what = self.without_ids(&what);
                 Line::from(vec![Span::styled(clock(e.at), faint()), Span::raw(format!(" {what}"))])
             })
             .collect();
@@ -495,7 +574,7 @@ impl App {
             })
             .collect();
         // Fewer events and edges when the pane is short, at least one of each.
-        let (mut nd, mut nw) = (did.len().min(8), with.len().min(8));
+        let (mut nd, mut nw) = (did.len().min(3), with.len().min(8));
         while out.len() + 2 + nd.max(1) + nw.max(1) > rows && nd.max(nw) > 1 {
             if nd >= nw { nd -= 1 } else { nw -= 1 }
         }
@@ -576,6 +655,27 @@ impl App {
         out
     }
 
+    /// The Accounts section: per account, a bar for its 5-hour and one for
+    /// its 7-day limit, in the session bars' style, or one line saying why
+    /// there are none. Asking for the usage starts its fetching.
+    fn accounts(&self, w: usize) -> Vec<Line<'static>> {
+        let Some(limits) = &self.limits else { return Vec::new() };
+        let usage = limits.usage();
+        let mut head = vec![Span::styled("Accounts", bold())];
+        if let Some(t) = usage.iter().map(|u| u.fetched_at).max().filter(|&t| t > 0) {
+            head.push(Span::styled(format!("  fetched {}", clock(t)), faint()));
+        }
+        let mut out = vec![Line::from(head)];
+        if usage.is_empty() {
+            out.push(Line::styled("  no ~/.claude*/.credentials.json", faint()));
+        }
+        for u in &usage {
+            out.extend(account_lines(u, w));
+        }
+        out.push(Line::raw(""));
+        out
+    }
+
     fn usage(&self, snap: &Snapshot, a: &Agent, w: usize) -> Vec<Line<'static>> {
         let root = snap.by_id.get(&a.session_id).unwrap_or(a);
         let total = snap.subtree_usage(&root.id);
@@ -624,6 +724,56 @@ impl App {
     }
 }
 
+/// One account's rows: `<name> 5h  ████░░  62%  resets 14:10` and
+/// `        7d  ██░░░░  36%  resets Fri 22:00`, else `<name>  <why not>`.
+fn account_lines(u: &AccountUsage, w: usize) -> Vec<Line<'static>> {
+    let name = truncate(&u.name, 16);
+    let why = match (&u.error, u.fetched_at) {
+        (Some(e), _) => Some(e.clone()),
+        (None, 0) => Some("fetching…".into()),
+        _ => None,
+    };
+    if let Some(why) = why {
+        return vec![Line::from(vec![Span::raw(format!("{}  ", fit(&name, 20))), Span::styled(why, faint())])];
+    }
+    // The label column of the session bars; room on the right for "100%  resets Fri 22:00".
+    let bar_w = w.saturating_sub(45).max(4);
+    let pad = " ".repeat(name.chars().count());
+    vec![
+        limit_line(&format!("{name} 5h"), u.five_hour, bar_w, hour_minute),
+        limit_line(&format!("{pad} 7d"), u.seven_day, bar_w, weekday_time),
+    ]
+}
+
+/// A bar of bar_w cells filled to the limit's percent, then the percent
+/// and the reset time as `when` writes it.
+fn limit_line(label: &str, l: Option<Limit>, bar_w: usize, when: fn(i64) -> String) -> Line<'static> {
+    let pct = l.map_or(0.0, |l| l.pct.clamp(0.0, 100.0));
+    let n = ((bar_w as f64 * pct / 100.0) as usize).min(bar_w);
+    let mut spans = vec![
+        Span::raw(format!("{}  ", fit(label, 20))),
+        Span::styled("█".repeat(n), Style::new().fg(Color::Indexed(63))),
+        Span::styled("░".repeat(bar_w - n), faint()),
+        Span::raw(match l {
+            Some(_) => format!(" {:>3}%", pct.round()),
+            None => "    -".into(),
+        }),
+    ];
+    if let Some(t) = l.map(|l| l.resets_at).filter(|&t| t > 0) {
+        spans.push(Span::styled(format!("  resets {}", when(t)), faint()));
+    }
+    Line::from(spans)
+}
+
+/// Fri 22:00 in local time.
+fn weekday_time(t: i64) -> String {
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let l = local(t);
+    // 1970-01-01, day 0, was a Thursday.
+    let day = DAYS[(days_from_civil(l.year, l.month, l.day) + 4).rem_euclid(7) as usize];
+    format!("{day} {:02}:{:02}", l.hour, l.min)
+}
+
 /// Where a card of size (w, h) goes beside anchor, the cells of its agent:
 /// right of it, else left, else below, else above, else at the pane's right
 /// edge; always inside pane.
@@ -649,7 +799,7 @@ pub fn place((w, h): (u16, u16), anchor: Rect, pane: Rect) -> Rect {
 /// placed beside anchor inside pane: a buffer of exactly its cells, every
 /// one written, so it hides what is under it.
 pub fn card(lines: Vec<Line<'static>>, anchor: Rect, pane: Rect) -> Buffer {
-    let w = u16::try_from(lines.iter().map(Line::width).max().unwrap_or(0) + 4).unwrap_or(u16::MAX).clamp(24, 56);
+    let w = u16::try_from(lines.iter().map(Line::width).max().unwrap_or(0) + 4).unwrap_or(u16::MAX).clamp(24, CARD_W);
     let h = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
     let at = place((w, h), anchor, pane);
     let mut buf = Buffer::empty(at);
@@ -790,10 +940,15 @@ mod tests {
         let pane = Rect::new(0, 0, 140, 40);
         let card = card(app.card_lines(38), Rect::new(10, 5, 8, 6), pane);
         let text = rows_of(&card).join("\n");
-        for want in ["a1 title", "Explore · opus-4-5 · running", "tokens 30 · turns 3 · last activity 10s ago", "now: Bash: cargo test", "did:", "with:"] {
+        let a1 = format!("{} · a1 title", app.animal("a1"));
+        for want in [a1.as_str(), "role: subagent · Explore", "opus-4-5 · running", "last activity 10s ago", "now: Bash: cargo test", "did:", "with:"] {
             assert!(text.contains(want), "{want:?} not in\n{text}");
         }
-        // Newest first, names resolved: the lead is "lead", others their title.
+        // Usage is the tree's: no tokens, turns or cache on the card.
+        for unwanted in ["token", "turns", "in 10", "out 20", "cache"] {
+            assert!(!text.contains(unwanted), "{unwanted:?} in\n{text}");
+        }
+        // Newest first, names resolved: the lead is "lead", others their animal.
         let at = |s: &str| text.find(s).unwrap_or_else(|| panic!("{s:?} not in\n{text}"));
         assert!(at(&format!("{} reply: found it", clock(102 * SEC))) < at(&format!("{} Bash: cargo test", clock(101 * SEC))), "{text}");
         assert!(at("message to lead 3s \"the bug is in parse\"") < at("spawned by lead 5s"), "{text}");
@@ -801,9 +956,53 @@ mod tests {
 
         app.focus = "s1".into();
         let text = app.card_lines(38).iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
-        let order: Vec<usize> = ["handback from a2 title", "message from a1 title", "spawned a2 title", "spawned a1 title"].iter().map(|s| text.find(s).unwrap_or_else(|| panic!("{s:?} not in\n{text}"))).collect();
+        assert!(text.contains("role: session lead\nopus-4-5 · active\n"), "{text}");
+        let (n1, n2) = (app.animal("a1"), app.animal("a2"));
+        let want = [format!("handback from {n2} "), format!("message from {n1} "), format!("spawned {n2} "), format!("spawned {n1} ")];
+        let order: Vec<usize> = want.iter().map(|s| text.find(s.as_str()).unwrap_or_else(|| panic!("{s:?} not in\n{text}"))).collect();
         assert!(order.is_sorted(), "newest first: {order:?}\n{text}");
         assert!(text.contains("did:\n(none)"), "{text}");
+    }
+
+    /// The card calls every agent by an animal, never its id: in its first
+    /// line, in what it did (ids cut short too) and in whom it dealt with.
+    /// Each agent keeps its animal from scan to scan, and no two share one.
+    #[test]
+    fn card_names_agents_by_animals_not_ids() {
+        use crate::scan::Event;
+        let (lead, sub, peer) = ("2ac51449-c1e2-4e4b-a850-045b77a0fca3", "a5582ca84087f834d", "a90e3abd17305b7ae");
+        let mut s = Snapshot { roots: vec![lead.into()], scanned_at: 110 * SEC, ..Snapshot::default() };
+        let mut a = agent(sub, lead, Status::Running);
+        a.title = String::new();
+        a.last_tool = format!("SendMessage: to {}…", &peer[..10]);
+        a.events = vec![Event { at: 101 * SEC, kind: "tool_use", tool: "SendMessage".into(), summary: format!("SendMessage: to {lead}") }];
+        for x in [agent(lead, "", Status::Active), a, agent(peer, lead, Status::Idle)] {
+            s.by_id.insert(x.id.clone(), x);
+        }
+        let mut app = App::new(0, 1);
+        app.set_snapshot(s.clone());
+        let names: Vec<String> = [lead, sub, peer].iter().map(|id| app.animal(id).to_string()).collect();
+        assert!(names.iter().all(|n| ANIMALS.contains(&n.as_str())), "{names:?}");
+        assert_eq!(names.iter().collect::<HashSet<_>>().len(), 3, "{names:?}");
+
+        app.focus = sub.into();
+        let text = app.card_lines(38).iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
+        assert!(!text.contains(&lead[..8]) && !text.contains(&sub[..8]) && !text.contains(&peer[..8]), "an id on the card:\n{text}");
+        assert!(text.starts_with(&format!("● {}\n", names[1])), "{text}");
+        assert!(text.contains(&format!("now: SendMessage: to {}", names[2])) && text.contains("SendMessage: to lead"), "{text}");
+        app.focus = lead.into();
+        let text = app.card_lines(38).iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
+        assert!(text.lines().next().is_some_and(|l| l.contains(&format!(" {} · ", names[0]))), "the lead's animal leads its card:\n{text}");
+
+        // A later scan with more agents, even many more than there are animals, renames no one.
+        for i in 0..150 {
+            let x = agent(&format!("a{i:016x}"), lead, Status::Idle);
+            s.by_id.insert(x.id.clone(), x);
+        }
+        app.set_snapshot(s.clone());
+        assert_eq!([lead, sub, peer].map(|id| app.animal(id).to_string()).to_vec(), names);
+        let all: HashSet<&str> = s.by_id.keys().map(|id| app.animal(id)).collect();
+        assert_eq!(all.len(), s.by_id.len(), "two agents share an animal");
     }
 
     /// A short pane keeps the card's sections, with fewer lines in each.
@@ -819,7 +1018,7 @@ mod tests {
         let text = lines.iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
         assert_eq!(lines.len(), 12, "{text}");
         assert!(text.contains("Read: f19") && !text.contains("Read: f15") && text.contains("with:\nmessage to lead"), "{text}");
-        assert_eq!(app.card_lines(40).iter().filter(|l| l.to_string().starts_with("Read: ") || l.to_string().contains(" Read: ")).count(), 8);
+        assert_eq!(app.card_lines(40).iter().filter(|l| l.to_string().starts_with("Read: ") || l.to_string().contains(" Read: ")).count(), 3);
     }
 
     #[test]
@@ -880,6 +1079,52 @@ mod tests {
         app.snap.as_mut().unwrap().by_id.get_mut("a2").unwrap().last_activity = 110 * SEC - actors::LEAVE_AFTER - 1;
         app.refresh_scene(110 * SEC, 0.1, &mut cast);
         assert_eq!((app.focus.as_str(), app.card), ("s1", false));
+    }
+
+    #[test]
+    fn limit_bars_fill_to_the_percent() {
+        let bar = |pct: f64| limit_line("work 5h", Some(Limit { pct, resets_at: 0 }), 10, hour_minute).to_string();
+        assert_eq!(bar(0.0), format!("{}  ░░░░░░░░░░   0%", fit("work 5h", 20)));
+        assert_eq!(bar(62.0), format!("{}  ██████░░░░  62%", fit("work 5h", 20)));
+        assert_eq!(bar(100.0), format!("{}  ██████████ 100%", fit("work 5h", 20)));
+        assert_eq!(bar(140.0), bar(100.0));
+        assert_eq!(limit_line("x", None, 4, hour_minute).to_string(), format!("{}  ░░░░    -", fit("x", 20)));
+        let t = crate::scan::parse_rfc3339("2026-11-21T22:00:00Z").unwrap();
+        let l = limit_line("x", Some(Limit { pct: 36.0, resets_at: t }), 4, weekday_time).to_string();
+        assert!(l.ends_with(&format!(" 36%  resets {}", weekday_time(t))), "{l}");
+        assert!(["Sat", "Sun"].iter().any(|d| weekday_time(t).starts_with(d)), "a Saturday in UTC: {}", weekday_time(t));
+    }
+
+    #[test]
+    fn usage_tab_lists_accounts() {
+        use crate::limits::Account;
+        let u = AccountUsage {
+            name: "personal".into(),
+            five_hour: Some(Limit { pct: 62.0, resets_at: 100 * SEC }),
+            seven_day: Some(Limit { pct: 36.0, resets_at: 200 * SEC }),
+            fetched_at: 90 * SEC,
+            error: None,
+        };
+        let rows: Vec<String> = account_lines(&u, 68).iter().map(Line::to_string).collect();
+        assert!(rows[0].starts_with("personal 5h  ") && rows[0].contains(&format!(" 62%  resets {}", hour_minute(100 * SEC))), "{rows:?}");
+        assert!(rows[1].starts_with("         7d  ") && rows[1].contains(&format!(" 36%  resets {}", weekday_time(200 * SEC))), "{rows:?}");
+        assert!(rows.iter().all(|r| r.chars().count() <= 68), "{rows:?}");
+        let e = AccountUsage { name: "work".into(), error: Some("HTTP 429".into()), ..AccountUsage::default() };
+        assert_eq!(account_lines(&e, 68).iter().map(Line::to_string).collect::<Vec<_>>(), [format!("{}  HTTP 429", fit("work", 20))]);
+
+        // Offline: on the Usage tab, above the session's bars; never on the others.
+        let mut app = App::new(0, 1);
+        app.view = View::Tree;
+        app.set_snapshot(snap());
+        let acct = |name: &str| Account { name: name.into(), dir: "/nonexistent".into() };
+        app.limits = Some(Limits::new(vec![acct("default"), acct("work")], true));
+        let s = screen(&mut app);
+        assert!(!s.contains("Accounts"), "{s}");
+        press(&mut app, KeyCode::Char('3'));
+        let s = screen(&mut app);
+        let at = |t: &str| s.find(t).unwrap_or_else(|| panic!("{t:?} not in\n{s}"));
+        let (default, work) = (format!("{}  offline", fit("default", 20)), format!("{}  offline", fit("work", 20)));
+        assert!(at("Accounts") < at(&default) && at(&default) < at(&work) && at(&work) < at("Session s1  total"), "{s}");
     }
 
     #[test]
