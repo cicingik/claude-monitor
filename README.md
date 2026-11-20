@@ -10,6 +10,8 @@ are animated characters at desks, in the meeting room, in the lounges and the
 kitchen, or walking through; a pet strolls round the lobby. Click one
 to see what it did. Press `v` for the tree and tabs.
 
+![The office: six sessions at once. The lead works at the manager's desk, idle agents doze in the lounges and the kitchen, a visitor walks in past reception, and the pet sits in the lobby.](docs/office.png)
+
 It is read-only. It reads transcript files under `~/.claude/projects` and every
 `~/.claude-*/projects` (so the sessions of several accounts show together). Its
 only network call is the one that shows each account's plan limits in the
@@ -274,6 +276,14 @@ All sessions share one office. There are no session keys.
 
 The office shows no text except the card.
 
+| The manager's office | The lobby |
+|---|---|
+| ![The lead at the manager's desk, a speech bubble over its head; another agent dozes on the sofa.](docs/office-manager.png) | ![A visitor walks in through the entrance while the pet sits by the reception desk.](docs/office-lobby.png) |
+
+The pictures in `docs/` are `office --snapshot` renders with the default
+character (`--sprites` pointed at an empty directory), so they hold no custom
+art.
+
 ## Keys
 
 | Key                              | Action |
@@ -386,6 +396,7 @@ your settings allow without asking.
 | `1` `2` `3`       | Activity, Interactions, Usage |
 | `p`               | type in the prompt panel   |
 | `o`               | resume the selected session in the background, then type in its panel |
+| mouse drag        | select text inside one pane (tree, prompt or details) and copy it to the clipboard on release, through the terminal (OSC 52; in tmux, `set -g set-clipboard on`) |
 | `v`               | switch to the office view  |
 | `r`               | drop all state and rescan  |
 | `q`, `ctrl+c`     | quit                       |
@@ -410,7 +421,8 @@ keys (orange border), every key is text; `esc` gives them back to the tree.
 
 The panel reads like Claude Code's own: the session's conversation fills it,
 newest at the bottom (your prompts after `>`, its replies after `●`, whole and
-wrapped, its tool calls on one line each, prompts sent from office included),
+wrapped, its tool calls on one line each, prompts sent from office included;
+a prompt the session has not taken yet shows last, dim, marked not taken yet),
 and you type in a rounded box under it. What the session waits on sits just
 over the box: a permission request (`asks: Bash: rm -rf build`), a question
 with its numbered options (asked one at a time when there are several), or a
@@ -425,7 +437,8 @@ plan waiting for approval.
 | `1` `2` `3`      | with an empty prompt: answer the waiting permission request yes · yes, don't ask again · no |
 | `1`…`9`          | with an empty prompt: pick that option of the session's question; or type your own answer and `enter` |
 | `pgup` `pgdn`, mouse wheel | scroll the conversation; sending a prompt goes back to the newest |
-| `↑`/`↓`          | with no command list: move to another row, so another session |
+| `↑`/`↓`          | with no command list: walk this project's earlier prompts, newest first (Claude Code's own history and those sent from office); `↓` past the newest brings back what you were typing, and any edit ends the walk |
+| `ctrl+x`         | take back a sent prompt the session has not taken yet; it goes back into the box to edit |
 | `esc`            | back to the tree |
 | `ctrl+c`         | quit |
 
@@ -462,6 +475,12 @@ How it works (files in `$XDG_STATE_HOME/claude-monitor/bridge`, else
   "queued" and it is taken at the end of the session's next turn. The session
   reads it as a hook message that says it came from claude-monitor, not as
   text typed into its prompt box.
+- **Taking a prompt back:** a prompt not taken yet is the file `prompt.txt`
+  in the session's folder there; `ctrl+x` deletes it, so the session never
+  reads it. Once the hook has taken it, there is nothing left to take back.
+- **Prompt history:** prompts sent from office are appended to `history.jsonl`
+  there. `↑`/`↓` merge it by time with the account's own `history.jsonl`,
+  which only Claude Code writes.
 - **Slash commands:** that hook message never reaches Claude Code's command
   parser, so office sends a command as its file instead: a skill's `SKILL.md`
   or a custom command's `.md`, from the project's `.claude`, the account, or an
@@ -471,9 +490,17 @@ How it works (files in `$XDG_STATE_HOME/claude-monitor/bridge`, else
 
 ## Data sources
 
-All paths are under `--root` (default `~/.claude/projects` and every
-`~/.claude-*/projects`). Nothing else under `~/.claude*` is read, except each
-account's `.credentials.json` for the [Accounts](#accounts) limits.
+Transcripts are under `--root` (default `~/.claude/projects` and every
+`~/.claude-*/projects`). Besides them, office reads these files of each account
+(`~/.claude` and every `~/.claude-*`), and never writes them except where noted:
+
+| File | For |
+|------|-----|
+| `.credentials.json` | the [Accounts](#accounts) limits |
+| `sessions/<pid>.json` | which sessions a running Claude Code process holds |
+| `settings.json` | whether the hooks are installed, and the enabled plugins; `office hook install` and `uninstall` write it |
+| `plugins/installed_plugins.json`, `skills/`, `commands/`, and the project's `.claude/` | the slash commands of the [prompt panel](#prompt-panel) |
+| `history.jsonl` | the prompts `↑`/`↓` recall in the prompt panel |
 
 - `<project>/<sessionId>.jsonl`: the main session, one JSON object per line.
   The project directory is the session cwd with `/` replaced by `-`; the UI
@@ -484,8 +511,8 @@ account's `.credentials.json` for the [Accounts](#accounts) limits.
   `description`, `toolUseId`, `finished`.
 
 Line types used: `assistant` (model, usage, `tool_use` and `text` blocks),
-`user` (prompts, `tool_result`, handback notices) and `ai-title`. Other types,
-unknown fields and malformed lines are skipped.
+`user` (prompts, `tool_result`, handback notices), `ai-title` and
+`permission-mode`. Other types, unknown fields and malformed lines are skipped.
 
 How the numbers and links are derived:
 
@@ -502,9 +529,11 @@ How the numbers and links are derived:
 - **Handback edge.** A user line containing `<agent-message from="<agentId>"`,
   from that agent to the transcript owner.
 
-Only short summaries are shown: tool names with a short argument, and at most
-60 characters of any prompt or reply. Transcripts can hold secrets, so the
-monitor never prints full message text.
+The tree and `--dump` show short summaries: tool names with a short argument,
+and at most 60 characters of any prompt or reply. The prompt panel shows the
+session's prompts and replies whole (up to 4000 characters each, the last 50
+events), as Claude Code's own window does. Transcripts can hold secrets, so
+mind who sees your screen while the panel is open.
 
 ## Development
 
@@ -513,3 +542,36 @@ cargo build --release && cargo test && cargo clippy -- -D warnings
 ```
 
 Some tests read `assets/office.png`.
+
+To see the walk graph (corridors, places, the visitors' and the pet's stops)
+drawn over the room:
+
+```sh
+OFFICE_GRAPH_PNG=/tmp/g.png cargo test graph_picture -- --ignored
+OFFICE_GRAPH_PNG=/tmp/g.png OFFICE_GRAPH_BASE=assets/forest.png cargo test graph_picture -- --ignored
+```
+
+`assets/forest.png` is the same room painted as a forest camp, every place
+where the graph expects it. `python3 tools/forest_map.py [OUT.png]` repaints it
+(needs Pillow and numpy).
+
+### Code map
+
+| File | What it does |
+|------|--------------|
+| `src/main.rs` | startup, the frame loop, `--dump` and `--snapshot` |
+| `src/cli.rs` | flags and the usage text |
+| `src/terminal.rs` | the terminal's graphics protocol, and restoring it on exit |
+| `src/patch.rs` | iTerm2 incremental painting: only the cells that changed |
+| `src/scene.rs` | where the room sits in the pane, and the character sprites |
+| `src/cast.rs` | custom characters from the sprites directory |
+| `src/actors.rs` | who sits where; `actors/graph.rs` the corridors, `actors/walk.rs` movement, `actors/paint.rs` drawing |
+| `src/scan.rs` | the scan of every projects directory; `scan/transcript.rs` one transcript, `scan/text.rs` text and time helpers |
+| `src/ui.rs` | app state and keys; `ui/draw.rs` the tree view, `ui/panel.rs` the prompt panel, `ui/card.rs` the office card, `ui/select.rs` mouse selection |
+| `src/bridge.rs` | the hooks' side and office's side of talking to sessions |
+| `src/commands.rs` | a session's slash commands, and the message a prompt is sent as |
+| `src/history.rs` | the prompts `↑`/`↓` recall |
+| `src/edit.rs` | the prompt line being typed |
+| `src/markdown.rs` | replies rendered as in Claude Code |
+| `src/limits.rs` | the accounts' plan limits |
+| `src/format.rs` | times, durations and labels as printed |
