@@ -59,6 +59,7 @@ mod cli;
 mod commands;
 mod edit;
 mod format;
+mod history;
 mod limits;
 mod markdown;
 mod patch;
@@ -78,6 +79,8 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime},
 };
+
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 
 use image::RgbaImage;
 use ratatui::{
@@ -215,6 +218,11 @@ fn show(out: &mut Counted, office: &RgbaImage, cast: &mut Cast, d: &Display, app
             let stage = stage.as_ref().expect("set above");
             if app.view == View::Tree {
                 term.draw(|f| app.draw(f))?;
+                if let Some(text) = app.copied.take() {
+                    // OSC 52: the terminal puts it on the system clipboard.
+                    term.backend_mut().write_all(d.wrap(format!("\x1b]52;c;{}\x07", BASE64.encode(text))).as_bytes())?;
+                    term.backend_mut().flush()?;
+                }
             } else if !l.area.is_empty() {
                 let composing = Instant::now();
                 let (img, items) = stage.compose(office.dimensions(), app, cast, t);
@@ -280,6 +288,10 @@ fn show(out: &mut Counted, office: &RgbaImage, cast: &mut Cast, d: &Display, app
                 Event::Mouse(m) if m.kind == MouseEventKind::ScrollDown => Some(app.wheel(false)),
                 // A click on the card itself leaves it be.
                 Event::Mouse(m) if on_screen.as_ref().is_some_and(|c| c.area.contains((m.column, m.row).into())) => None,
+                Event::Mouse(m) if app.view == View::Tree => {
+                    app.mouse(m.kind, m.column, m.row);
+                    Some(Action::None)
+                }
                 Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) && app.view == View::Office => {
                     let on = shown.as_ref().zip(stage.as_ref()).and_then(|(items, s)| hit(&app.scene, items, &s.layout, m.column, m.row));
                     app.click(on);

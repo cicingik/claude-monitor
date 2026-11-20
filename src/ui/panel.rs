@@ -3,25 +3,27 @@
 use std::time::SystemTime;
 
 use ratatui::{
-    crossterm::event::{KeyCode, KeyEvent},
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
 
 use crate::{
     bridge::{self, Answer},
+    history,
     commands,
     markdown,
     format::{label, short_id},
     scan::{Agent, Status, truncate},
 };
 
-use super::{Action, App, Here, Resuming, View, bold, faint, status_color};
+use super::{Action, App, Here, Recall, Resuming, View, bold, faint, status_color};
 
 /// A session's conversation, oldest first, as Claude Code shows it: a
 /// prompt after `>` as typed, a reply after `●` in markdown, a tool call dim;
 /// whole texts wrapped to w. A session with no events yet shows its last reply.
-fn log_lines(s: &Agent, w: usize) -> Vec<Line<'static>> {
+/// A prompt left for it and not taken yet comes last, dim, marked so.
+fn log_lines(s: &Agent, queued: Option<&str>, w: usize) -> Vec<Line<'static>> {
     let text_w = w.saturating_sub(2).max(1);
     let block = |out: &mut Vec<Line<'static>>, mark: &'static str, mark_style: Style, body: Vec<Line<'static>>| {
         out.push(Line::raw(""));
@@ -44,6 +46,10 @@ fn log_lines(s: &Agent, w: usize) -> Vec<Line<'static>> {
     }
     if out.is_empty() && !s.last_text.is_empty() {
         block(&mut out, "● ", Style::new(), markdown::render(&s.last_text, text_w));
+    }
+    if let Some(q) = queued {
+        block(&mut out, "> ", faint(), wrap(q, text_w).into_iter().map(|l| Line::styled(l, faint())).collect());
+        out.push(Line::styled(truncate("  not taken yet · ctrl+x takes it back", w), faint()));
     }
     out
 }
@@ -119,8 +125,8 @@ impl App {
         self.live = self.panel_session().is_some_and(|a| self.view == View::Tree && bridge::live(&a.config_dir, &a.id));
         let id = self.panel_session().map(|a| a.id.clone()).filter(|_| self.view == View::Tree);
         (self.ask, self.queued) = match id {
-            Some(id) => (bridge::ask(&self.bridge, &id), bridge::queued(&self.bridge, &id)),
-            None => (None, false),
+            Some(id) => (bridge::ask(&self.bridge, &id), bridge::queued(&self.bridge, &id).map(|m| commands::typed(&m).unwrap_or(m))),
+            None => (None, None),
         };
         let key = self.panel_session().map(|a| (a.config_dir.clone(), a.cwd.clone()));
         if key.is_some() && key != self.commands_for {
@@ -226,14 +232,15 @@ impl App {
         let menu: Vec<String> = commands::matching(&self.commands, &typed).iter().map(|c| c.name.clone()).collect();
         let picked = menu.get(self.menu_at.min(menu.len().saturating_sub(1))).cloned();
         match k.code {
-            KeyCode::Esc => self.typing = false,
-            KeyCode::Up if !menu.is_empty() => self.menu_at = (self.menu_at.min(menu.len() - 1) + menu.len() - 1) % menu.len(),
-            KeyCode::Down if !menu.is_empty() => self.menu_at = (self.menu_at.min(menu.len() - 1) + 1) % menu.len(),
+            KeyCode::Esc => (self.typing, self.recall) = (false, None),
+            KeyCode::Up if self.recall.is_none() && !menu.is_empty() => self.menu_at = (self.menu_at.min(menu.len() - 1) + menu.len() - 1) % menu.len(),
+            KeyCode::Down if self.recall.is_none() && !menu.is_empty() => self.menu_at = (self.menu_at.min(menu.len() - 1) + 1) % menu.len(),
+            KeyCode::Char('x') if k.modifiers.contains(KeyModifiers::CONTROL) => self.take_back(&id),
+            KeyCode::Up => self.recall_step(true),
+            KeyCode::Down => self.recall_step(false),
             KeyCode::Tab if picked.is_some() => self.input.set(&format!("/{} ", picked.expect("checked above"))),
             KeyCode::PageUp => self.scroll_log(self.page() as isize),
             KeyCode::PageDown => self.scroll_log(-(self.page() as isize)),
-            KeyCode::Up => self.move_cursor(-1),
-            KeyCode::Down => self.move_cursor(1),
             // A question: a digit picks its option, typed text and enter is an answer of one's own.
             KeyCode::Char(c @ '1'..='9') if self.input.is_empty() && self.question().is_some_and(|q| (c as usize - '0' as usize) <= q.options.len()) => {
                 let label = self.question().expect("checked above").options[c as usize - '1' as usize].0.clone();
@@ -255,11 +262,50 @@ impl App {
             KeyCode::Enter if !typed.trim().is_empty() => self.send(&id, &picked.map_or(typed, |n| format!("/{n}"))),
             _ => {
                 if self.input.key(k) {
-                    self.menu_at = 0;
+                    (self.menu_at, self.recall) = (0, None);
                 }
             }
         }
         Action::None
+    }
+
+    /// Takes back the prompt the session has not taken yet, into the box
+    /// when nothing is typed there.
+    fn take_back(&mut self, session: &str) {
+        self.note = match bridge::cancel(&self.bridge, session) {
+            Ok(Some(m)) => {
+                self.queued = None;
+                if self.input.is_empty() {
+                    self.input.set(&commands::typed(&m).unwrap_or(m));
+                }
+                "taken back: the session will not see it".into()
+            }
+            Ok(None) => "nothing to take back: no prompt is waiting".into(),
+            Err(e) => format!("cannot take it back: {e}"),
+        };
+    }
+
+    /// One step of the walk through the project's prompts: older begins it
+    /// at the newest; newer past the newest ends it, the draft back.
+    fn recall_step(&mut self, older: bool) {
+        let r = match self.recall.take() {
+            Some(r) => r,
+            None if !older => return,
+            None => {
+                let Some(s) = self.panel_session() else { return };
+                let list = history::load(&s.config_dir, &self.bridge, &s.cwd);
+                Recall { at: list.len(), list, draft: self.input.text() }
+            }
+        };
+        let at = if older { r.at.saturating_sub(1) } else { r.at + 1 };
+        match r.list.get(at) {
+            Some(p) => {
+                self.input.set(p);
+                self.recall = Some(Recall { at, ..r });
+            }
+            None if older => {} // no prompts
+            None => self.input.set(&r.draft),
+        }
     }
 
     /// Leaves the prompt for the session, framed by commands::message; a
@@ -277,8 +323,12 @@ impl App {
             Ok(false) => "queued: the session takes it once it ends its turn".into(),
             Err(e) => format!("not sent: {e}"),
         };
+        if let (Some(cwd), Some(typed)) = (self.agent(session).map(|a| a.cwd.clone()), commands::typed(&message)) {
+            let _ = history::add(&self.bridge, &cwd, &typed); // recall is a convenience: a failure loses no prompt
+        }
         self.input.clear();
-        self.queued = true;
+        self.recall = None;
+        self.queued = commands::typed(&message);
         self.log_scroll = 0;
     }
 
@@ -319,7 +369,7 @@ impl App {
         bottom.extend(self.input_box(w));
         bottom.extend(wrap(&self.note, w).into_iter().take(NOTE_LINES).map(|l| Line::styled(l, faint())));
         let room = h.saturating_sub(1 + waits.len() + bottom.len());
-        let log = log_lines(s, w);
+        let log = log_lines(s, self.queued.as_deref(), w);
         let max = log.len().saturating_sub(room);
         self.log_max.set(max);
         let up = self.log_scroll.min(max);
@@ -377,7 +427,6 @@ impl App {
                     out.push(Line::styled("…", faint()));
                 }
             }
-            None if self.queued => out.push(Line::styled("prompt waiting to be taken…", faint())),
             None => {}
         }
         out

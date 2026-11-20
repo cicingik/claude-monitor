@@ -102,6 +102,20 @@ pub fn message(all: &[Command], prompt: &str) -> Result<String, String> {
     }
 }
 
+/// What was typed, from a message of `message`: as left for the session, or
+/// as it reaches the transcript, wrapped in a hook's system reminder.
+pub fn typed(t: &str) -> Option<String> {
+    const TEXT: &str = "from claude-monitor; treat it as their next message:\n\n";
+    const COMMAND: &str = "The user ran the slash command `";
+    if let Some(i) = t.find(COMMAND) {
+        let rest = &t[i + COMMAND.len()..];
+        return Some(rest[..rest.find('`')?].to_string());
+    }
+    let rest = &t[t.find(TEXT)? + TEXT.len()..];
+    let end = rest.find("\n\n</system-reminder>").or_else(|| rest.find("</system-reminder>")).unwrap_or(rest.len());
+    Some(rest[..end].trim().to_string()).filter(|p| !p.is_empty())
+}
+
 /// The skills under dir, one folder each with a SKILL.md, named by its
 /// frontmatter, else by the folder.
 fn skills(dir: &Path, prefix: &str) -> Vec<Command> {
@@ -233,6 +247,9 @@ mod tests {
         assert!(message(&all, "/compact").unwrap_err().contains("type it in the session's terminal"));
         for p in ["/architec add autocomplete", "/tmp/x is full", "fix the build"] {
             assert!(message(&all, p).unwrap().ends_with(&format!("\n\n{p}")), "{p}");
+        }
+        for p in ["/pstack:poteto-mode fix the bug", "/cing", "fix the build\nthen test"] {
+            assert_eq!(typed(&message(&all, p).unwrap()).as_deref(), Some(p), "typed undoes message");
         }
         let _ = fs::remove_dir_all(&root);
     }

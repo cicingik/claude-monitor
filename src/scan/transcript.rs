@@ -9,6 +9,8 @@ use std::{
 
 use serde_json::Value;
 
+use crate::commands;
+
 use super::{
     ACTIVE_WINDOW, Agent, Event, Kind, MAX_EVENTS, MAX_TEXT, RUNNING_WINDOW, Status, Usage, WAIT_QUIET, WAIT_WINDOW,
     text::{NOW_MAX, asking, one_line, parse_rfc3339, s, tool_summary, truncate},
@@ -317,7 +319,7 @@ impl FileState {
             }
         }
         for t in texts {
-            let sent = office_prompt(t);
+            let sent = commands::typed(t);
             let t = sent.as_deref().unwrap_or(t);
             if let Some(from) = agent_message_from(t) {
                 self.handbacks.push(Sent { at, to: from.into(), label: String::new() });
@@ -364,20 +366,6 @@ fn may_be_relevant(mut b: &[u8]) -> bool {
 }
 
 /// The sender id of the first `<agent-message from="<id>"` in t.
-/// The prompt in a hook message from office's bridge (see commands::message),
-/// which reaches the transcript wrapped in a system reminder: what was typed.
-fn office_prompt(t: &str) -> Option<String> {
-    const TEXT: &str = "from claude-monitor; treat it as their next message:\n\n";
-    const COMMAND: &str = "The user ran the slash command `";
-    if let Some(i) = t.find(COMMAND) {
-        let rest = &t[i + COMMAND.len()..];
-        return Some(rest[..rest.find('`')?].to_string());
-    }
-    let rest = &t[t.find(TEXT)? + TEXT.len()..];
-    let end = rest.find("\n\n</system-reminder>").or_else(|| rest.find("</system-reminder>")).unwrap_or(rest.len());
-    Some(rest[..end].trim().to_string()).filter(|p| !p.is_empty())
-}
-
 fn agent_message_from(t: &str) -> Option<&str> {
     const OPEN: &str = "<agent-message from=\"";
     let mut rest = t;
@@ -416,10 +404,10 @@ mod tests {
     fn a_prompt_from_office_reads_as_typed() {
         let wrapped = |m: &str| format!("<task-notification>\n<summary>Stop hook feedback</summary>\n</task-notification>\n<system-reminder>\nStop hook blocking error from command \"Stop\": {m}\n\n</system-reminder>");
         let text = wrapped("The user sent this prompt from claude-monitor; treat it as their next message:\n\nfix the build\nthen test");
-        assert_eq!(office_prompt(&text).as_deref(), Some("fix the build\nthen test"));
+        assert_eq!(commands::typed(&text).as_deref(), Some("fix the build\nthen test"));
         let cmd = wrapped("The user ran the slash command `/pstack:poteto-mode fix it` from claude-monitor; treat it as their next message, typed as a command. Read /x/SKILL.md in full");
-        assert_eq!(office_prompt(&cmd).as_deref(), Some("/pstack:poteto-mode fix it"));
-        assert_eq!(office_prompt("<system-reminder>something else</system-reminder>"), None);
+        assert_eq!(commands::typed(&cmd).as_deref(), Some("/pstack:poteto-mode fix it"));
+        assert_eq!(commands::typed("<system-reminder>something else</system-reminder>"), None);
         let mut st = FileState::default();
         st.parse_user(&serde_json::json!({"message": {"content": text}}), 1);
         assert_eq!((st.events[0].kind, st.events[0].text.as_str()), ("prompt", "fix the build\nthen test"));

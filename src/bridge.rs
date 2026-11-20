@@ -167,9 +167,21 @@ pub fn send(root: &Path, session: &str, prompt: &str) -> io::Result<bool> {
     Ok(waiter.is_some_and(|p| !cfg!(unix) || alive_pid(p)))
 }
 
-/// Whether a prompt left for the session is still waiting to be taken.
-pub fn queued(root: &Path, session: &str) -> bool {
-    session_dir(root, session).join("prompt.txt").exists()
+/// Takes back the message left for the session, if the session has not
+/// taken it yet: Ok(None) when there is none left.
+pub fn cancel(root: &Path, session: &str) -> io::Result<Option<String>> {
+    let p = session_dir(root, session).join("prompt.txt");
+    let Ok(m) = fs::read_to_string(&p) else { return Ok(None) };
+    match fs::remove_file(&p) {
+        Ok(()) => Ok(Some(m)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None), // the hook took it meanwhile
+        Err(e) => Err(e),
+    }
+}
+
+/// The message left for the session, while it is still waiting to be taken.
+pub fn queued(root: &Path, session: &str) -> Option<String> {
+    fs::read_to_string(session_dir(root, session).join("prompt.txt")).ok()
 }
 
 // The hooks' side: `office hook permission` and `office hook wait`, with the
@@ -707,7 +719,7 @@ mod tests {
         }
         assert!(send(&root, "s1@work", "run the tests").unwrap(), "a waiter is there");
         assert_eq!(second.join().unwrap().as_deref(), Some("run the tests"));
-        assert!(!queued(&root, "s1") && !d.join("waiter").exists());
+        assert!(queued(&root, "s1").is_none() && !d.join("waiter").exists());
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use ratatui::{
     Frame,
-    layout::Rect,
+    layout::{Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
@@ -50,6 +50,7 @@ impl App {
         // The pane may have changed since the cursor last moved, while the office was shown.
         self.scroll_to_cursor();
         self.draw_tree(f, area);
+        self.draw_selection(f);
     }
 
     fn line(f: &mut Frame, area: Rect, y: u16, spans: Vec<Span<'static>>) {
@@ -86,6 +87,7 @@ impl App {
         let left = Rect::new(area.x, area.y + 1, lw, tree_h);
         let panel = Rect::new(area.x, area.y + 1 + tree_h, lw, panel_h.min(body_h - tree_h));
         let right = Rect::new(area.x + lw, area.y + 1, rw, body_h);
+        self.panes.set([left, panel, right].map(|r| r.inner(Margin::new(1, 1))));
         f.render_widget(Paragraph::new(self.tree_lines(usize::from(lw.saturating_sub(2)))).block(block()), left);
         let edge = if self.typing { Color::Indexed(208) } else { Color::Indexed(240) };
         let title = Span::styled(" prompt ", Style::new().fg(edge));
@@ -96,7 +98,7 @@ impl App {
             f.render_widget(Paragraph::new(self.detail_lines(usize::from(rw - 2))).block(block()), right);
         }
         let keys: &[(&str, &str)] = if self.typing {
-            &[("enter", "send prompt"), ("/", "commands, tab completes"), ("←/→", "cursor"), ("pgup/pgdn", "scroll"), ("digits", "answer (empty prompt)"), ("↑/↓", "session"), ("esc", "back to tree"), ("ctrl+c", "quit")]
+            &[("enter", "send prompt"), ("/", "commands, tab completes"), ("←/→", "cursor"), ("pgup/pgdn", "scroll"), ("digits", "answer (empty prompt)"), ("↑/↓", "history"), ("ctrl+x", "take back a waiting prompt"), ("esc", "back to tree"), ("ctrl+c", "quit")]
         } else {
             &[("↑/k", "up"), ("↓/j", "down"), ("enter", "collapse/expand"), ("p", "prompt"), ("o", "resume session"), ("tab", "next tab"), ("1-3", "tab"), ("v", "office"), ("r", "rescan"), ("q", "quit")]
         };

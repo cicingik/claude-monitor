@@ -12,6 +12,7 @@ use std::{
 
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::Span,
 };
@@ -29,6 +30,7 @@ use crate::{
 mod card;
 mod draw;
 mod panel;
+mod select;
 
 pub use card::card;
 
@@ -93,12 +95,24 @@ pub struct App {
     log_for: String,       // the session the scroll is for: another starts at the newest                           // the command picked in the menu of those matching the input
     note: String,     // what the last prompt or answer did
     ask: Option<Ask>, // the session's permission request waiting for an answer
-    queued: bool,     // a prompt left for the session, not taken yet
+    queued: Option<String>, // as typed: the prompt left for the session, not taken yet
     picks: Vec<String>, // answers given so far to the questions of the ask with id picks_for
     picks_for: String,
     live: bool, // a running Claude Code process holds the session
     resuming: Option<Resuming>,
+    recall: Option<Recall>, // a walk through the history with ↑/↓, if one is on
+    selection: Option<select::Selection>, // text dragged over in the tree view
+    panes: Cell<[Rect; 3]>, // the insides of the tree, prompt and detail panes, as last drawn
+    pub copied: Option<String>, // selected text for main to put on the clipboard
     here_for: Option<Here>, // the session whose background resume needs a terminal: o runs it here
+}
+
+/// A walk through the session's project's prompts: the prompt at shows,
+/// draft is what was being typed when it began.
+struct Recall {
+    list: Vec<String>,
+    at: usize,
+    draft: String,
 }
 
 /// A `claude --resume --bg` until it returns, and what explains its result.
@@ -183,11 +197,15 @@ impl App {
             log_for: String::new(),
             note: String::new(),
             ask: None,
-            queued: false,
+            queued: None,
             picks: Vec::new(),
             picks_for: String::new(),
             live: false,
             resuming: None,
+            recall: None,
+            selection: None,
+            panes: Cell::new([Rect::default(); 3]),
+            copied: None,
             here_for: None,
         }
     }
@@ -240,6 +258,7 @@ impl App {
 
     /// Handles a key press.
     pub fn key(&mut self, k: KeyEvent) -> Action {
+        self.selection = None;
         let ctrl_c = k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
         if self.typing && self.view == View::Tree && !ctrl_c {
             return self.panel_key(k);
@@ -418,7 +437,7 @@ mod tests {
         limits::{AccountUsage, Limit},
         scan::{EdgeKind, SEC, Usage},
     };
-    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, crossterm::event::KeyEventKind, layout::Rect, text::Line};
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, crossterm::event::KeyEventKind, text::Line};
 
     fn agent(id: &str, parent: &str, status: Status) -> Agent {
         Agent {
@@ -815,6 +834,149 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert!(!root.join("s1").join("prompt.txt").exists() && app.note.contains("built into Claude Code"), "{}", app.note);
         assert_eq!(app.input.text(), "/comp", "a built-in stays typed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ↑/↓ in the panel walk the project's prompts, Claude Code's own (pasted
+    /// text filled in) and those sent from office, newest first; past the
+    /// newest, what was being typed comes back.
+    #[test]
+    fn up_and_down_in_the_panel_recall_the_projects_prompts() {
+        let root = std::env::temp_dir().join(format!("office-recall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (config, bridge) = (root.join("config"), root.join("bridge"));
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("history.jsonl"), concat!(
+            r#"{"display":"first","pastedContents":{},"timestamp":1,"project":"/proj"}"#, "\n",
+            r#"{"display":"elsewhere","pastedContents":{},"timestamp":2,"project":"/other"}"#, "\n",
+            r#"{"display":"look at [Pasted text #1 +1 lines]","pastedContents":{"1":{"id":1,"type":"text","content":"a\nb"}},"timestamp":3,"project":"/proj"}"#, "\n",
+        )).unwrap();
+        let mut app = App::new(0, 1);
+        (app.bridge, app.hooks) = (bridge.clone(), true);
+        let mut snap = busy_snap();
+        let s1 = snap.by_id.get_mut("s1").unwrap();
+        (s1.config_dir, s1.cwd) = (config.clone(), "/proj".into());
+        app.set_snapshot(snap);
+        app.focus = "s1".into();
+        press(&mut app, KeyCode::Char('p'));
+        for c in "sent here".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        for c in "draft".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Up);
+            seen.push(app.input.text());
+        }
+        assert_eq!(seen, ["sent here", "look at a\nb", "first", "first"]);
+        assert_eq!(app.selected, "s1", "the arrows recall, they do not move the tree");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('!'));
+        assert_eq!(app.input.text(), "look at a\nb!", "an edit ends the walk, keeping the text");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.input.text(), "look at a\nb!", "no walk, no step");
+        app.input.set("draft");
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.input.text(), "draft", "past the newest, the draft comes back");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A prompt sent while the session works shows in its conversation at
+    /// once, as typed and marked not taken yet, and goes once the hook takes it.
+    #[test]
+    fn a_sent_prompt_shows_in_the_conversation_until_taken() {
+        let root = std::env::temp_dir().join(format!("office-pending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut app = App::new(0, 1);
+        (app.bridge, app.hooks) = (root.clone(), true);
+        app.set_snapshot(busy_snap());
+        app.focus = "s1".into();
+        press(&mut app, KeyCode::Char('p'));
+        for c in "fix the build".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        app.poll_bridge();
+        let s = screen(&mut app);
+        assert!(s.contains("> fix the build"), "{s}");
+        assert!(s.contains("not taken yet"), "{s}");
+
+        std::fs::remove_file(root.join("s1").join("prompt.txt")).unwrap();
+        app.poll_bridge();
+        let s = screen(&mut app);
+        assert!(!s.contains("fix the build") && !s.contains("not taken yet"), "{s}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A drag in the tree view selects text inside the pane it starts in,
+    /// highlighted, and the release copies it; a click alone copies nothing.
+    #[test]
+    fn a_drag_in_the_tree_view_copies_the_text_of_one_pane() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = App::new(0, 1);
+        app.set_snapshot(busy_snap());
+        app.view = View::Tree;
+        let s = screen(&mut app);
+        let rows: Vec<Vec<char>> = s.lines().map(|l| l.chars().collect()).collect();
+        let word: Vec<char> = "Recent events".chars().collect();
+        let (y, x) = rows.iter().enumerate().find_map(|(y, r)| r.windows(word.len()).position(|w| w == word).map(|x| (y, x))).expect("Recent events on screen");
+        let (x, y) = (x as u16, y as u16);
+
+        app.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        app.mouse(MouseEventKind::Drag(MouseButton::Left), x + 5, y);
+        app.mouse(MouseEventKind::Drag(MouseButton::Left), x + 12, y);
+        app.mouse(MouseEventKind::Up(MouseButton::Left), x + 12, y);
+        let mut t = Terminal::new(TestBackend::new(120, 80)).unwrap();
+        t.draw(|f| app.draw(f)).unwrap();
+        assert!(t.backend().buffer()[(x + 3, y)].modifier.contains(Modifier::REVERSED), "the selection shows");
+        assert_eq!(app.copied.take().as_deref(), Some("Recent events"));
+        assert!(app.note.starts_with("copied 13 chars"), "{}", app.note);
+
+        // Dragged out over the tree to the left, it stops at its pane's edge.
+        app.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        app.mouse(MouseEventKind::Drag(MouseButton::Left), 0, y + 1);
+        app.mouse(MouseEventKind::Up(MouseButton::Left), 0, y + 1);
+        t.draw(|f| app.draw(f)).unwrap();
+        let text = app.copied.take().expect("copied");
+        assert!(text.starts_with("Recent events") && text.split('\n').count() == 2 && !text.contains('│'), "{text:?}");
+
+        app.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        app.mouse(MouseEventKind::Up(MouseButton::Left), x, y);
+        t.draw(|f| app.draw(f)).unwrap();
+        assert_eq!(app.copied, None, "a click selects nothing");
+        assert!(!t.backend().buffer()[(x, y)].modifier.contains(Modifier::REVERSED));
+    }
+
+    /// ctrl+x takes back a prompt the session has not taken yet, into the
+    /// box to edit; once taken, there is nothing to take back.
+    #[test]
+    fn ctrl_x_takes_back_a_prompt_not_taken_yet() {
+        let root = std::env::temp_dir().join(format!("office-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut app = App::new(0, 1);
+        (app.bridge, app.hooks) = (root.clone(), true);
+        app.set_snapshot(busy_snap());
+        app.focus = "s1".into();
+        press(&mut app, KeyCode::Char('p'));
+        for c in "fix the build".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert_eq!(app.key(ctrl_x), Action::None);
+        app.poll_bridge();
+        assert!(!root.join("s1").join("prompt.txt").exists());
+        assert_eq!(app.input.text(), "fix the build");
+        assert!(app.note.starts_with("taken back"), "{}", app.note);
+        assert!(!screen(&mut app).contains("not taken yet"));
+
+        app.input.clear();
+        app.key(ctrl_x);
+        assert!(app.note.starts_with("nothing to take back"), "{}", app.note);
         let _ = std::fs::remove_dir_all(&root);
     }
 
