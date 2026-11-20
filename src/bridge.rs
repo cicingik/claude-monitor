@@ -10,7 +10,7 @@
 //!   running, the hook returns at once.
 //! - Stop and SessionStart run `office hook wait` as an asyncRewake hook: it
 //!   waits in the background, never blocking the session, until office
-//!   leaves a prompt (prompt.txt, the text the session reads, which office
+//!   leaves a prompt (prompt-<nanos>.txt, the text the session reads, which office
 //!   frames: see commands::message), then exits 2, which wakes the session with
 //!   it. One waiter per session: a newer one retires the older.
 //!
@@ -158,30 +158,52 @@ pub fn answer(root: &Path, session: &str, ask: &Ask, a: Answer) -> io::Result<()
     put(&session_dir(root, session).join(format!("answer-{}.json", ask.id)), a.body().as_bytes())
 }
 
-/// Leaves a prompt for the session's waiter; a prompt not yet taken is
-/// replaced. Says whether a waiter is there to take it now.
+/// The prompts left in d and not taken yet, oldest first: one file each,
+/// prompt-<unix nanos>.txt, so no send replaces another.
+fn prompts(d: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = fs::read_dir(d)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("prompt-") && n.ends_with(".txt")))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Removes the prompt at p and gives its text, unless the other side
+/// removed it first (the waiter took it, or office took it back).
+fn claim(p: &Path) -> Option<String> {
+    let m = fs::read_to_string(p).ok()?;
+    fs::remove_file(p).ok()?;
+    Some(m)
+}
+
+/// Leaves a prompt for the session's waiter, after any not taken yet. Says
+/// whether a waiter is there to take it now.
 pub fn send(root: &Path, session: &str, prompt: &str) -> io::Result<bool> {
     let d = session_dir(root, session);
-    put(&d.join("prompt.txt"), prompt.as_bytes())?;
+    let at = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    put(&d.join(format!("prompt-{at:020}.txt")), prompt.as_bytes())?;
     let waiter = fs::read_to_string(d.join("waiter")).ok().and_then(|p| p.trim().parse::<i64>().ok());
     Ok(waiter.is_some_and(|p| !cfg!(unix) || alive_pid(p)))
 }
 
-/// Takes back the message left for the session, if the session has not
-/// taken it yet: Ok(None) when there is none left.
+/// Takes back the newest prompt left for the session and not taken yet:
+/// Ok(None) when there is none left.
 pub fn cancel(root: &Path, session: &str) -> io::Result<Option<String>> {
-    let p = session_dir(root, session).join("prompt.txt");
-    let Ok(m) = fs::read_to_string(&p) else { return Ok(None) };
-    match fs::remove_file(&p) {
-        Ok(()) => Ok(Some(m)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None), // the hook took it meanwhile
-        Err(e) => Err(e),
-    }
+    Ok(prompts(&session_dir(root, session)).iter().rev().find_map(|p| claim(p)))
 }
 
-/// The message left for the session, while it is still waiting to be taken.
-pub fn queued(root: &Path, session: &str) -> Option<String> {
-    fs::read_to_string(session_dir(root, session).join("prompt.txt")).ok()
+/// The oldest prompt left in d, taken: what the waiter wakes the session with.
+fn take(d: &Path) -> Option<String> {
+    prompts(d).iter().find_map(|p| claim(p))
+}
+
+/// The prompts left for the session and not taken yet, oldest first.
+pub fn queued(root: &Path, session: &str) -> Vec<String> {
+    prompts(&session_dir(root, session)).iter().filter_map(|p| fs::read_to_string(p).ok()).collect()
 }
 
 // The hooks' side: `office hook permission` and `office hook wait`, with the
@@ -316,8 +338,7 @@ fn wait(d: &Path) -> Option<String> {
         if fs::read_to_string(&waiter).ok().as_deref() != Some(me.as_str()) {
             return None; // retired: the newer waiter owns the file
         }
-        if let Ok(p) = fs::read_to_string(d.join("prompt.txt")) {
-            let _ = fs::remove_file(d.join("prompt.txt"));
+        if let Some(p) = take(d) {
             break Some(p);
         }
         beat += 1;
@@ -358,7 +379,9 @@ fn session_pid() -> i32 {
 fn entries(exe: &str) -> [(&'static str, Value); 3] {
     let cmd = |kind: &str| format!("\"{exe}\"{MARK}{kind}");
     let permission = json!({ "matcher": "*", "hooks": [{ "type": "command", "command": cmd("permission"), "timeout": HOLD.as_secs() + 30 }] });
-    let wait = json!({ "hooks": [{ "type": "command", "command": cmd("wait"), "asyncRewake": true }] });
+    // Claude Code kills a hook after its timeout, async ones too (600 s by
+    // default): the waiter must outlive an idle session's quiet hours.
+    let wait = json!({ "hooks": [{ "type": "command", "command": cmd("wait"), "asyncRewake": true, "timeout": WAITER_LIFE.as_secs() }] });
     [("PermissionRequest", permission), ("Stop", wait.clone()), ("SessionStart", wait)]
 }
 
@@ -420,12 +443,15 @@ pub fn install(config_dir: &Path, exe: Option<&str>) -> io::Result<()> {
     put(&path, &body)
 }
 
-/// Whether config_dir/settings.json runs office's hooks.
+/// Whether config_dir/settings.json runs office's hooks as this office
+/// installs them: an older install's waiter dies after Claude Code's default
+/// hook timeout.
 pub fn installed(config_dir: &Path) -> bool {
     let Ok(b) = fs::read(config_dir.join("settings.json")) else { return false };
     let Ok(v) = serde_json::from_slice::<Value>(&b) else { return false };
-    let lists = |event: &str| v.get("hooks").and_then(|h| h.get(event)).and_then(Value::as_array).is_some_and(|a| a.iter().any(is_ours));
-    lists("PermissionRequest") && lists("Stop")
+    let ours = |event: &str| v.get("hooks").and_then(|h| h.get(event)).and_then(Value::as_array).into_iter().flatten().filter(|e| is_ours(e)).cloned().collect::<Vec<_>>();
+    let waits = |e: &Value| e["hooks"][0]["timeout"].as_u64().is_some_and(|t| t >= WAITER_LIFE.as_secs());
+    !ours("PermissionRequest").is_empty() && ["Stop", "SessionStart"].iter().all(|ev| ours(ev).iter().any(waits))
 }
 
 /// `office hook install|uninstall`, over every config dir: a report line each.
@@ -474,12 +500,6 @@ pub fn overlay(snap: &mut crate::scan::Snapshot, root: &Path) {
 
 // Resuming a session that no process holds, in the background.
 
-/// Whether a running Claude Code process holds session: one of the
-/// config dir's sessions/<pid>.json names it, and that pid lives.
-pub fn live(config_dir: &Path, session: &str) -> bool {
-    live_ids(config_dir).contains(session.split('@').next().unwrap_or(session))
-}
-
 /// The sessions running Claude Code processes of config_dir hold, by the
 /// id in their sessions/<pid>.json, background ones included.
 pub fn live_ids(config_dir: &Path) -> std::collections::HashSet<String> {
@@ -506,13 +526,13 @@ fn alive_pid(_: i64) -> bool {
     false // not known here: resuming then lets Claude Code say it runs already
 }
 
-/// `claude` as office runs it for session: in its folder (gone: an error
-/// saying so), under its account's config dir, as if from a plain shell.
-fn claude(config_dir: &Path, cwd: &str) -> io::Result<process::Command> {
+/// The claude program, as office runs it for session: in its folder (gone:
+/// an error saying so), under its account's config dir, as if from a plain shell.
+fn claude(program: &Path, config_dir: &Path, cwd: &str) -> io::Result<process::Command> {
     if !cwd.is_empty() && !Path::new(cwd).is_dir() {
         return Err(io::Error::new(io::ErrorKind::NotFound, format!("its folder {} no longer exists", tilde(cwd))));
     }
-    let mut cmd = process::Command::new("claude");
+    let mut cmd = process::Command::new(program);
     if !cwd.is_empty() {
         cmd.current_dir(cwd);
     }
@@ -541,9 +561,9 @@ fn not_on_path(e: io::Error) -> io::Error {
 /// Starts `claude --resume <session> --bg` in cwd under config_dir: Claude
 /// Code's own background session, needing no terminal (`claude attach` shows
 /// it). It returns once the session started; its output says how it went.
-pub fn resume(config_dir: &Path, cwd: &str, session: &str) -> io::Result<process::Child> {
+pub fn resume(program: &Path, config_dir: &Path, cwd: &str, session: &str) -> io::Result<process::Child> {
     let id = session.split('@').next().unwrap_or(session);
-    let mut cmd = claude(config_dir, cwd)?;
+    let mut cmd = claude(program, config_dir, cwd)?;
     cmd.args(["--resume", id, "--bg"]).stdin(process::Stdio::null()).stdout(process::Stdio::piped()).stderr(process::Stdio::piped());
     cmd.spawn().map_err(not_on_path)
 }
@@ -551,9 +571,9 @@ pub fn resume(config_dir: &Path, cwd: &str, session: &str) -> io::Result<process
 /// Runs `claude --resume <session>` in this terminal until it exits: for
 /// what a background session cannot do, such as asking whether to trust its
 /// folder. The caller hands the terminal over first and takes it back after.
-pub fn resume_here(config_dir: &Path, cwd: &str, session: &str) -> io::Result<process::ExitStatus> {
+pub fn resume_here(program: &Path, config_dir: &Path, cwd: &str, session: &str) -> io::Result<process::ExitStatus> {
     let id = session.split('@').next().unwrap_or(session);
-    let mut cmd = claude(config_dir, cwd)?;
+    let mut cmd = claude(program, config_dir, cwd)?;
     cmd.args(["--resume", id]).status().map_err(not_on_path)
 }
 
@@ -606,6 +626,23 @@ mod tests {
         d
     }
 
+    /// Prompts sent before the session takes one queue up, each its own:
+    /// the waiter takes the oldest, ctrl+x takes back the newest.
+    #[test]
+    fn prompts_queue_in_order_and_none_replaces_another() {
+        let root = tmp("queue");
+        for p in ["first", "second", "third"] {
+            send(&root, "s1", p).unwrap();
+        }
+        assert_eq!(queued(&root, "s1"), ["first", "second", "third"]);
+        assert_eq!(take(&session_dir(&root, "s1")).as_deref(), Some("first"));
+        assert_eq!(cancel(&root, "s1").unwrap().as_deref(), Some("third"));
+        assert_eq!(queued(&root, "s1"), ["second"]);
+        assert_eq!(take(&session_dir(&root, "s1")).as_deref(), Some("second"));
+        assert_eq!((take(&session_dir(&root, "s1")), cancel(&root, "s1").unwrap()), (None, None));
+        assert!(queued(&root, "s1").is_empty());
+    }
+
     /// Installing keeps every other setting and hook, twice is once, and
     /// uninstalling gives back what was there.
     #[test]
@@ -621,6 +658,16 @@ mod tests {
         assert_eq!(v["model"], "opus");
         assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 2, "theirs and ours, once: {v}");
         assert_eq!(v["hooks"]["Stop"][1]["hooks"][0]["asyncRewake"], true);
+        for event in ["Stop", "SessionStart"] {
+            let ours = v["hooks"][event].as_array().unwrap().last().unwrap();
+            assert_eq!(ours["hooks"][0]["timeout"], WAITER_LIFE.as_secs(), "Claude Code would kill the waiter after its default 600 s: {event}");
+        }
+        let mut old = v.clone();
+        old["hooks"]["Stop"][1]["hooks"][0].as_object_mut().unwrap().remove("timeout");
+        fs::write(d.join("settings.json"), serde_json::to_vec_pretty(&old).unwrap()).unwrap();
+        assert!(!installed(&d), "an install from before the waiter's timeout is out of date");
+        install(&d, Some("/opt/office")).unwrap();
+        assert!(installed(&d), "installing again brings it up to date");
         assert_eq!(v["hooks"]["PermissionRequest"][0]["hooks"][0]["command"], "\"/opt/office\" hook permission");
         let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
         assert_eq!(keys, ["model", "hooks", "z"], "the user's key order is kept");
@@ -719,7 +766,7 @@ mod tests {
         }
         assert!(send(&root, "s1@work", "run the tests").unwrap(), "a waiter is there");
         assert_eq!(second.join().unwrap().as_deref(), Some("run the tests"));
-        assert!(queued(&root, "s1").is_none() && !d.join("waiter").exists());
+        assert!(queued(&root, "s1").is_empty() && !d.join("waiter").exists());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -731,9 +778,10 @@ mod tests {
         let me = process::id();
         fs::write(d.join("sessions").join(format!("{me}.json")), json!({ "pid": me, "sessionId": "s1" }).to_string()).unwrap();
         fs::write(d.join("sessions").join("1.json"), json!({ "pid": 999_999_999i64, "sessionId": "s2" }).to_string()).unwrap();
-        assert!(live(&d, "s1@work"));
-        assert!(!live(&d, "s2"), "its process is gone");
-        assert!(!live(&d, "s3"), "never registered");
+        let held = live_ids(&d);
+        assert!(held.contains("s1"));
+        assert!(!held.contains("s2"), "its process is gone");
+        assert!(!held.contains("s3"), "never registered");
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -785,7 +833,7 @@ mod tests {
         let m = resume_failed(&format!("Error: Workspace not trusted. {} is your home directory, and ...", home.display()), &work, &home.to_string_lossy(), "s1@work");
         assert!(m.contains("home directory") && m.ends_with("cd ~ && CLAUDE_CONFIG_DIR=~/.claude-work claude --resume s1"), "{m}");
         assert_eq!(resume_failed("boom", &work, &cwd, "s1"), "not resumed: boom");
-        let gone = resume(&work, "/nonexistent/office-gone", "s1").unwrap_err();
+        let gone = resume(Path::new("claude"), &work, "/nonexistent/office-gone", "s1").unwrap_err();
         assert_eq!(gone.to_string(), "its folder /nonexistent/office-gone no longer exists");
     }
 }

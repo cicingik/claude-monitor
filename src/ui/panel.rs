@@ -23,7 +23,7 @@ use super::{Action, App, Here, Recall, Resuming, View, bold, faint, status_color
 /// prompt after `>` as typed, a reply after `●` in markdown, a tool call dim;
 /// whole texts wrapped to w. A session with no events yet shows its last reply.
 /// A prompt left for it and not taken yet comes last, dim, marked so.
-fn log_lines(s: &Agent, queued: Option<&str>, w: usize) -> Vec<Line<'static>> {
+fn log_lines(s: &Agent, queued: &[String], w: usize) -> Vec<Line<'static>> {
     let text_w = w.saturating_sub(2).max(1);
     let block = |out: &mut Vec<Line<'static>>, mark: &'static str, mark_style: Style, body: Vec<Line<'static>>| {
         out.push(Line::raw(""));
@@ -47,9 +47,11 @@ fn log_lines(s: &Agent, queued: Option<&str>, w: usize) -> Vec<Line<'static>> {
     if out.is_empty() && !s.last_text.is_empty() {
         block(&mut out, "● ", Style::new(), markdown::render(&s.last_text, text_w));
     }
-    if let Some(q) = queued {
+    for q in queued {
         block(&mut out, "> ", faint(), wrap(q, text_w).into_iter().map(|l| Line::styled(l, faint())).collect());
-        out.push(Line::styled(truncate("  not taken yet · ctrl+x takes it back", w), faint()));
+    }
+    if !queued.is_empty() {
+        out.push(Line::styled(truncate("  not taken yet · ctrl+x takes the last back", w), faint()));
     }
     out
 }
@@ -122,11 +124,11 @@ impl App {
     /// Reads what the panel shows from the bridge; call it every frame.
     pub fn poll_bridge(&mut self) {
         self.poll_resume();
-        self.live = self.panel_session().is_some_and(|a| self.view == View::Tree && bridge::live(&a.config_dir, &a.id));
+        self.live = self.panel_session().is_some_and(|a| self.view == View::Tree && a.live);
         let id = self.panel_session().map(|a| a.id.clone()).filter(|_| self.view == View::Tree);
         (self.ask, self.queued) = match id {
-            Some(id) => (bridge::ask(&self.bridge, &id), bridge::queued(&self.bridge, &id).map(|m| commands::typed(&m).unwrap_or(m))),
-            None => (None, None),
+            Some(id) => (bridge::ask(&self.bridge, &id), bridge::queued(&self.bridge, &id).into_iter().map(|m| commands::typed(&m).unwrap_or(m)).collect()),
+            None => (None, Vec::new()),
         };
         let key = self.panel_session().map(|a| (a.config_dir.clone(), a.cwd.clone()));
         if key.is_some() && key != self.commands_for {
@@ -154,18 +156,24 @@ impl App {
         self.typing = true;
         if self.resuming.is_some() {
             self.note = "resuming a session already, wait for it".into();
-        } else if bridge::live(&a.config_dir, &a.id) {
+        } else if a.live {
             self.note = "running already: type a prompt".into();
         } else {
-            self.note = match bridge::resume(&a.config_dir, &a.cwd, &a.id) {
-                Ok(child) => {
-                    self.resuming = Some(Resuming { session: a.id.clone(), child, cwd: a.cwd.clone(), config_dir: a.config_dir.clone() });
-                    "resuming in the background…".into()
-                }
-                Err(e) => format!("cannot resume: {e}"),
-            };
+            self.note = self.resume_in_background(&a);
         }
         Action::None
+    }
+
+    /// Starts `claude --resume --bg` for a, whose waiter then takes any
+    /// prompt left for it: what happened, for the note.
+    fn resume_in_background(&mut self, a: &Agent) -> String {
+        match bridge::resume(&self.claude, &a.config_dir, &a.cwd, &a.id) {
+            Ok(child) => {
+                self.resuming = Some(Resuming { session: a.id.clone(), child, cwd: a.cwd.clone(), config_dir: a.config_dir.clone() });
+                "resuming it in the background…".into()
+            }
+            Err(e) => format!("cannot resume: {e}"),
+        }
     }
 
     /// Back from `claude --resume` in office's terminal.
@@ -190,6 +198,7 @@ impl App {
         }
         let said = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" · ");
         self.note = match (status.success(), said.is_empty()) {
+            (true, _) if !bridge::queued(&self.bridge, &session).is_empty() => "resumed in the background: it takes the waiting prompt now".into(),
             (true, true) => "resumed in the background: type a prompt".into(),
             (true, false) => format!("resumed: {said}"),
             (false, true) => format!("not resumed ({status})"),
@@ -269,12 +278,12 @@ impl App {
         Action::None
     }
 
-    /// Takes back the prompt the session has not taken yet, into the box
-    /// when nothing is typed there.
+    /// Takes back the newest prompt the session has not taken yet, into the
+    /// box when nothing is typed there.
     fn take_back(&mut self, session: &str) {
         self.note = match bridge::cancel(&self.bridge, session) {
             Ok(Some(m)) => {
-                self.queued = None;
+                self.queued.pop();
                 if self.input.is_empty() {
                     self.input.set(&commands::typed(&m).unwrap_or(m));
                 }
@@ -318,17 +327,22 @@ impl App {
                 return;
             }
         };
-        self.note = match bridge::send(&self.bridge, session, &message) {
-            Ok(true) => "sent".into(),
-            Ok(false) => "queued: the session takes it once it ends its turn".into(),
-            Err(e) => format!("not sent: {e}"),
+        let stopped = self.agent(session).filter(|a| !a.live).cloned();
+        self.note = match (bridge::send(&self.bridge, session, &message), stopped) {
+            (Ok(true), _) => "sent".into(),
+            // No process holds it: resume it, and its waiter takes the prompt.
+            (Ok(false), Some(_)) if self.resuming.as_ref().is_some_and(|r| r.session == session) => "queued; resuming it in the background…".into(),
+            (Ok(false), Some(_)) if self.resuming.is_some() => "queued: the session is not running, and another is resuming; o resumes this one after".into(),
+            (Ok(false), Some(a)) => format!("queued; {}", self.resume_in_background(&a)),
+            (Ok(false), None) => "queued: nothing in the session listens now; it reads this when a turn of it ends (ctrl+x takes it back)".into(),
+            (Err(e), _) => format!("not sent: {e}"),
         };
         if let (Some(cwd), Some(typed)) = (self.agent(session).map(|a| a.cwd.clone()), commands::typed(&message)) {
             let _ = history::add(&self.bridge, &cwd, &typed); // recall is a convenience: a failure loses no prompt
         }
         self.input.clear();
         self.recall = None;
-        self.queued = commands::typed(&message);
+        self.queued.extend(commands::typed(&message));
         self.log_scroll = 0;
     }
 
@@ -359,7 +373,7 @@ impl App {
         if !self.hooks {
             return vec![
                 head,
-                Line::styled("hooks not installed: quit, run", orange),
+                Line::styled("hooks missing or out of date: quit, run", orange),
                 Line::styled("  office hook install", orange),
                 Line::styled("then restart the Claude Code sessions", faint()),
             ];
@@ -369,7 +383,7 @@ impl App {
         bottom.extend(self.input_box(w));
         bottom.extend(wrap(&self.note, w).into_iter().take(NOTE_LINES).map(|l| Line::styled(l, faint())));
         let room = h.saturating_sub(1 + waits.len() + bottom.len());
-        let log = log_lines(s, self.queued.as_deref(), w);
+        let log = log_lines(s, &self.queued, w);
         let max = log.len().saturating_sub(room);
         self.log_max.set(max);
         let up = self.log_scroll.min(max);

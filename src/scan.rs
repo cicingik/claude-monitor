@@ -158,6 +158,7 @@ pub struct Agent {
     pub events: Vec<Event>,    // newest last, at most MAX_EVENTS
     pub children: Vec<String>, // ids, oldest first
     pub live: bool,            // a session a running Claude Code process holds, though its transcript may be quiet
+    pub continued: bool,       // its conversation moved on to another session id: nothing listens here
 }
 
 /// The view built by one scan.
@@ -309,7 +310,7 @@ impl Scanner {
         self.files.retain(|p, _| seen.contains(p));
         for id in &snap.roots {
             let a = snap.by_id.get_mut(id).expect("a root is an agent");
-            a.live = live.get(&a.config_dir).is_some_and(|held| held.contains(id.split('@').next().unwrap_or(id)));
+            a.live = !a.continued && live.get(&a.config_dir).is_some_and(|held| held.contains(id.split('@').next().unwrap_or(id)));
         }
         let by_id = &snap.by_id;
         snap.roots.sort_by(|a, b| by_id[b].last_activity.cmp(&by_id[a].last_activity));
@@ -564,6 +565,14 @@ mod tests {
         assert!(snap.by_id["held"].live);
         let snap = Scanner::new(vec![Root::new(cfg.join("projects"))], 0).scan(now);
         assert!(snap.by_id["held"].live && !snap.by_id["gone"].live);
+
+        // `/resume` in a terminal moves its conversation on to another id:
+        // the process still names the old one, but nothing listens there.
+        let moved = r#"{"type":"continued-in","timestamp":"2026-01-01T09:01:00Z","sessionId":"moved","continuedInSessionId":"other"}"#;
+        write(&cfg.join("projects").join("-p").join("moved.jsonl"), &[line, moved]);
+        fs::write(cfg.join("sessions").join("3.json"), format!(r#"{{"pid":{},"sessionId":"moved","kind":"interactive"}}"#, std::process::id())).unwrap();
+        let snap = Scanner::new(vec![Root::new(cfg.join("projects"))], 0).scan(now);
+        assert!(snap.by_id["held"].live && !snap.by_id["moved"].live);
         let _ = fs::remove_dir_all(&dir);
     }
 }

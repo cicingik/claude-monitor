@@ -416,13 +416,19 @@ then restart the sessions you want to reach:
 office hook install      # office hook uninstall removes them again
 ```
 
+Run it with the `office` you keep, such as `~/.local/bin/office`: the hooks
+run that very file, so a build directory that gets cleaned breaks them. Run it
+again after updating office; when the installed hooks are older than this
+office, the panel says they are out of date. A running session keeps the hooks
+it started with, so restart it (or `o` to resume it) to pick up new ones.
+
 Press `p` on an agent in the office, or in the tree. While the panel has the
 keys (orange border), every key is text; `esc` gives them back to the tree.
 
 The panel reads like Claude Code's own: the session's conversation fills it,
 newest at the bottom (your prompts after `>`, its replies after `●`, whole and
 wrapped, its tool calls on one line each, prompts sent from office included;
-a prompt the session has not taken yet shows last, dim, marked not taken yet),
+prompts the session has not taken yet show last, dim, marked not taken yet),
 and you type in a rounded box under it. What the session waits on sits just
 over the box: a permission request (`asks: Bash: rm -rf build`), a question
 with its numbered options (asked one at a time when there are several), or a
@@ -438,7 +444,7 @@ plan waiting for approval.
 | `1`…`9`          | with an empty prompt: pick that option of the session's question; or type your own answer and `enter` |
 | `pgup` `pgdn`, mouse wheel | scroll the conversation; sending a prompt goes back to the newest |
 | `↑`/`↓`          | with no command list: walk this project's earlier prompts, newest first (Claude Code's own history and those sent from office); `↓` past the newest brings back what you were typing, and any edit ends the walk |
-| `ctrl+x`         | take back a sent prompt the session has not taken yet; it goes back into the box to edit |
+| `ctrl+x`         | take back the last prompt sent that the session has not taken yet; it goes back into the box to edit |
 | `esc`            | back to the tree |
 | `ctrl+c`         | quit |
 
@@ -448,6 +454,8 @@ in the session's folder and under its config dir: Claude Code's own
 background session, which needs no terminal. Its waiter starts with it, so
 prompts from the panel reach it; `claude attach <id>` shows it in a terminal,
 `claude stop <id>` ends it. A session already running is not started twice.
+Sending a prompt to a session that is not running resumes it the same way, so
+the prompt reaches it with no terminal open.
 
 A background session cannot ask whether to trust its folder, so Claude Code
 refuses one in a folder that account has not trusted yet (and always in your
@@ -470,14 +478,22 @@ How it works (files in `$XDG_STATE_HOME/claude-monitor/bridge`, else
 - **Prompts:** `Stop` and `SessionStart` hooks (`office hook wait`) start a
   background waiter that never blocks the session (`asyncRewake`). A prompt
   you send wakes an idle session at once. Sent to a busy one, Claude Code hands
-  it over during or after that turn. A session that has not started or ended a
-  turn since the hooks were installed has no waiter yet; the panel says
-  "queued" and it is taken at the end of the session's next turn. The session
-  reads it as a hook message that says it came from claude-monitor, not as
-  text typed into its prompt box.
-- **Taking a prompt back:** a prompt not taken yet is the file `prompt.txt`
-  in the session's folder there; `ctrl+x` deletes it, so the session never
-  reads it. Once the hook has taken it, there is nothing left to take back.
+  it over during or after that turn. Prompts sent before the session takes one
+  queue up and arrive in the order sent, one per turn. The waiter waits up to
+  24 hours: its hook sets that as its `timeout`, because Claude Code kills a
+  hook after its timeout, background ones too, and the default is 10 minutes.
+  A session with no waiter (not started or ended a turn since the hooks were
+  installed) takes a prompt at the end of its next turn; the panel says
+  "queued" and why. The session reads it as a hook message that says it came
+  from claude-monitor, not as text typed into its prompt box.
+- **Taking a prompt back:** each prompt not taken yet is a file,
+  `prompt-<time>.txt`, in the session's folder there; `ctrl+x` deletes the
+  newest, so the session never reads it. Once the hook has taken it, there is
+  nothing left to take back.
+- **Sessions that moved on:** `/resume` or `/clear` in a terminal moves its
+  conversation to another session id. The old id no longer counts as running,
+  so the panel does not offer it as one; the conversation goes on under the
+  new id.
 - **Prompt history:** prompts sent from office are appended to `history.jsonl`
   there. `↑`/`↓` merge it by time with the account's own `history.jsonl`,
   which only Claude Code writes.

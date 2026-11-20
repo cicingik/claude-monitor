@@ -217,6 +217,7 @@ mod tests {
             events: Vec::new(),
             children: Vec::new(),
             live: false,
+            continued: false,
         }
     }
 

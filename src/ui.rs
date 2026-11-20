@@ -84,6 +84,7 @@ pub struct App {
     names: HashMap<String, String>,
     // The prompt panel under the tree, for the session of the selected row.
     pub bridge: PathBuf, // bridge::dir(), a temporary one in tests
+    pub claude: PathBuf, // the claude program sessions are resumed with; in tests, none, or a fake
     pub hooks: bool,     // office's hooks are in a Claude Code settings.json
     typing: bool,        // keys go to the panel, not the tree
     input: LineEdit,
@@ -95,7 +96,7 @@ pub struct App {
     log_for: String,       // the session the scroll is for: another starts at the newest                           // the command picked in the menu of those matching the input
     note: String,     // what the last prompt or answer did
     ask: Option<Ask>, // the session's permission request waiting for an answer
-    queued: Option<String>, // as typed: the prompt left for the session, not taken yet
+    queued: Vec<String>, // as typed, oldest first: the prompts left for the session, not taken yet
     picks: Vec<String>, // answers given so far to the questions of the ask with id picks_for
     picks_for: String,
     live: bool, // a running Claude Code process holds the session
@@ -186,6 +187,7 @@ impl App {
             limits: None,
             names: HashMap::new(),
             bridge: bridge::dir(),
+            claude: (if cfg!(test) { "office-test-no-claude" } else { "claude" }).into(),
             hooks: false,
             typing: false,
             input: LineEdit::default(),
@@ -197,7 +199,7 @@ impl App {
             log_for: String::new(),
             note: String::new(),
             ask: None,
-            queued: None,
+            queued: Vec::new(),
             picks: Vec::new(),
             picks_for: String::new(),
             live: false,
@@ -463,6 +465,7 @@ mod tests {
             events: Vec::new(),
             children: Vec::new(),
             live: false,
+            continued: false,
         }
     }
 
@@ -724,6 +727,36 @@ mod tests {
         assert!(app.here_for.is_none(), "offered once");
     }
 
+    /// A prompt sent to a session no process holds resumes it in the
+    /// background, whose waiter then takes the prompt: no terminal needed.
+    #[test]
+    fn a_prompt_to_a_session_not_running_resumes_it() {
+        let root = std::env::temp_dir().join(format!("office-autoresume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (fake, said) = (root.join("claude"), root.join("args"));
+        std::fs::write(&fake, format!("#!/bin/sh\necho \"$@\" > {}\necho 'Started in the background'\n", said.display())).unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let mut app = App::new(0, 1);
+        (app.bridge, app.hooks, app.claude) = (root.join("bridge"), true, fake);
+        app.set_snapshot(busy_snap());
+        app.focus = "s1".into();
+        press(&mut app, KeyCode::Char('p'));
+        for c in "check connection".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(app.note.starts_with("queued") && app.note.contains("resuming it in the background"), "{}", app.note);
+        while app.resuming.is_some() {
+            app.poll_resume();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read_to_string(&said).unwrap().trim(), "--resume s1 --bg");
+        assert_eq!(app.note, "resumed in the background: it takes the waiting prompt now");
+        assert_eq!(bridge::queued(&root.join("bridge"), "s1").len(), 1, "the prompt waits for the resumed session's waiter");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A long note wraps over several rows instead of being cut to one.
     #[test]
     fn panel_note_wraps_whole() {
@@ -783,7 +816,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         let got: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("s1").join("answer-7.json")).unwrap()).unwrap();
         assert_eq!(got, serde_json::json!({ "answers": { "Color?": "Blue", "Size?": "medium" } }));
-        assert!(!root.join("s1").join("prompt.txt").exists(), "an answer, not a prompt");
+        assert!(bridge::queued(&root, "s1").is_empty(), "an answer, not a prompt");
         assert_eq!(app.note, "answered: Blue · medium");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -824,15 +857,14 @@ mod tests {
         }
         assert_eq!(app.input.text(), "/pstack:polish fix the bug");
         press(&mut app, KeyCode::Enter);
-        let sent = std::fs::read_to_string(root.join("s1").join("prompt.txt")).unwrap();
+        let sent = bridge::cancel(&root, "s1").unwrap().expect("sent");
         assert!(sent.contains("Read /p/polish/SKILL.md in full") && sent.contains("arguments \"fix the bug\""), "{sent}");
-        std::fs::remove_file(root.join("s1").join("prompt.txt")).unwrap();
 
         for c in "/comp".chars() {
             press(&mut app, KeyCode::Char(c));
         }
         press(&mut app, KeyCode::Enter);
-        assert!(!root.join("s1").join("prompt.txt").exists() && app.note.contains("built into Claude Code"), "{}", app.note);
+        assert!(bridge::queued(&root, "s1").is_empty() && app.note.contains("built into Claude Code"), "{}", app.note);
         assert_eq!(app.input.text(), "/comp", "a built-in stays typed");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -905,7 +937,18 @@ mod tests {
         assert!(s.contains("> fix the build"), "{s}");
         assert!(s.contains("not taken yet"), "{s}");
 
-        std::fs::remove_file(root.join("s1").join("prompt.txt")).unwrap();
+        for c in "then test".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        app.poll_bridge();
+        let s = screen(&mut app);
+        let (first, second) = (s.find("> fix the build"), s.find("> then test"));
+        assert!(first.is_some() && second.is_some() && first < second, "both wait, in the order sent: {s}");
+
+        for _ in 0..2 {
+            bridge::cancel(&root, "s1").unwrap().expect("waiting"); // as the hook takes it
+        }
         app.poll_bridge();
         let s = screen(&mut app);
         assert!(!s.contains("fix the build") && !s.contains("not taken yet"), "{s}");
@@ -969,7 +1012,7 @@ mod tests {
         let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
         assert_eq!(app.key(ctrl_x), Action::None);
         app.poll_bridge();
-        assert!(!root.join("s1").join("prompt.txt").exists());
+        assert!(bridge::queued(&root, "s1").is_empty());
         assert_eq!(app.input.text(), "fix the build");
         assert!(app.note.starts_with("taken back"), "{}", app.note);
         assert!(!screen(&mut app).contains("not taken yet"));
@@ -999,7 +1042,7 @@ mod tests {
             assert_eq!(press(&mut app, KeyCode::Char(c)), Action::None);
         }
         press(&mut app, KeyCode::Enter);
-        assert!(std::fs::read_to_string(root.join("s1").join("prompt.txt")).unwrap().ends_with("next message:\n\nquit now"));
+        assert!(bridge::queued(&root, "s1")[0].ends_with("next message:\n\nquit now"));
         assert!(app.input.is_empty() && app.note.starts_with("queued"), "{}", app.note);
 
         // A permission request filed by the hook; 2 is "yes, don't ask again".

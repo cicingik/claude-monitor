@@ -58,6 +58,7 @@ pub(super) struct FileState {
     last_tool: String,
     last_text: String,
     asking: String, // of the last tool_use: what it asks the user, if anything
+    continued: bool, // the conversation moved on to another session id (`/resume`, `/clear`)
     pub(super) mode: String, // the last permission-mode entry: "default", "plan", "acceptEdits", "auto", ...
     resolved: HashSet<String>,     // tool_use ids that have a tool_result
     pub(super) spawns: HashMap<String, Spawn>, // tool_use id -> Agent/Task call
@@ -119,6 +120,7 @@ pub(super) fn build(st: &FileState, id: String, mtime: i64, now: i64, finished: 
         events: st.events.clone(),
         children: Vec::new(),
         live: false,
+        continued: st.continued,
     };
     for (mid, u) in &st.usage {
         a.usage = a.usage.add(*u);
@@ -207,6 +209,7 @@ impl FileState {
                 self.parse_user(&v, at);
             }
             "permission-mode" => self.mode = s(&v, "permissionMode").to_string(),
+            "continued-in" => self.continued = true,
             "ai-title" => {
                 let t = s(&v, "aiTitle");
                 if !t.is_empty() {
@@ -348,7 +351,7 @@ impl FileState {
 /// "type" key in b has an assistant, user or ai-title value.
 fn may_be_relevant(mut b: &[u8]) -> bool {
     const KEY: &[u8] = b"\"type\"";
-    const TYPES: [&[u8]; 4] = [b"\"assistant\"", b"\"user\"", b"\"ai-title\"", b"\"permission-mode\""];
+    const TYPES: [&[u8]; 5] = [b"\"assistant\"", b"\"user\"", b"\"ai-title\"", b"\"permission-mode\"", b"\"continued-in\""];
     let trim = |b: &[u8]| -> usize { b.iter().take_while(|&&c| c == b' ' || c == b'\t').count() };
     loop {
         let Some(i) = b.windows(KEY.len()).position(|w| w == KEY) else { return false };

@@ -325,7 +325,7 @@ fn show(out: &mut Counted, office: &RgbaImage, cast: &mut Cast, d: &Display, app
                         let back = term.backend_mut();
                         disable_raw_mode()?;
                         execute!(back, DisableMouseCapture, LeaveAlternateScreen, Show)?;
-                        let r = bridge::resume_here(&h.config_dir, &h.cwd, &h.session);
+                        let r = bridge::resume_here(&app.claude, &h.config_dir, &h.cwd, &h.session);
                         enable_raw_mode()?;
                         execute!(back, EnterAlternateScreen, SetTitle("office"), EnableMouseCapture)?;
                         app.ran_here(&h, r);
@@ -642,6 +642,7 @@ mod tests {
             events: Vec::new(),
             children: Vec::new(),
             live: false,
+            continued: false,
         }
     }
 
