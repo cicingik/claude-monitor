@@ -17,7 +17,7 @@ use crate::{
     scan::{Agent, Status, truncate},
 };
 
-use super::{Action, App, Here, Recall, Resuming, View, bold, faint, status_color};
+use super::{Action, App, Here, Launch, Recall, Resuming, View, bold, faint, status_color};
 
 /// A session's conversation, oldest first, as Claude Code shows it: a
 /// prompt after `>` as typed, a reply after `●` in markdown, a tool call dim;
@@ -148,8 +148,13 @@ impl App {
     /// Resumes the panel's session in the background, unless a process holds
     /// it already, and gives the keys to its panel.
     pub(super) fn resume(&mut self) -> Action {
+        // A new session that needs a terminal runs whatever row is selected.
+        if let Some(h) = self.here_for.take_if(|h| matches!(h.launch, Launch::New(_))) {
+            self.note = "starting it here…".into();
+            return Action::RunHere(h);
+        }
         let Some(a) = self.panel_session().cloned() else { return Action::None };
-        if let Some(h) = self.here_for.take().filter(|h| h.session == a.id) {
+        if let Some(h) = self.here_for.take_if(|h| h.launch == Launch::Resume(a.id.clone())) {
             self.note = format!("running {} here…", short_id(&a.id));
             return Action::RunHere(h);
         }
@@ -167,28 +172,35 @@ impl App {
     /// Starts `claude --resume --bg` for a, whose waiter then takes any
     /// prompt left for it: what happened, for the note.
     fn resume_in_background(&mut self, a: &Agent) -> String {
-        match bridge::resume(&self.claude, &a.config_dir, &a.cwd, &a.id) {
+        let launch = Launch::Resume(a.id.clone());
+        match bridge::start(&self.claude, &a.config_dir, &a.cwd, &launch) {
             Ok(child) => {
-                self.resuming = Some(Resuming { session: a.id.clone(), child, cwd: a.cwd.clone(), config_dir: a.config_dir.clone() });
+                self.resuming = Some(Resuming { launch, child, cwd: a.cwd.clone(), config_dir: a.config_dir.clone() });
                 "resuming it in the background…".into()
             }
             Err(e) => format!("cannot resume: {e}"),
         }
     }
 
-    /// Back from `claude --resume` in office's terminal.
+    /// Back from claude in office's terminal.
     pub fn ran_here(&mut self, h: &Here, r: std::io::Result<std::process::ExitStatus>) {
-        self.note = match r {
-            Ok(_) => format!("back from {}: its folder is trusted now if you accepted, so o resumes it in the background", short_id(&h.session)),
-            Err(e) => format!("cannot run it here: {e}"),
+        self.note = match (r, &h.launch) {
+            (Ok(_), Launch::Resume(s)) => format!("back from {}: its folder is trusted now if you accepted, so o resumes it in the background", short_id(s)),
+            (Ok(_), Launch::New(_)) => "back from the new session: its folder is trusted now if you accepted, so n starts the next one there in the background".into(),
+            (Err(e), _) => format!("cannot run it here: {e}"),
         };
+    }
+
+    /// Whether the claude office is starting is for session.
+    fn resuming_for(&self, session: &str) -> bool {
+        self.resuming.as_ref().is_some_and(|r| matches!(&r.launch, Launch::Resume(s) if s == session))
     }
 
     /// Takes the end of a resume: what `claude --bg` said, in the note.
     pub(super) fn poll_resume(&mut self) {
         let Some(r) = &mut self.resuming else { return };
         let Ok(Some(status)) = r.child.try_wait() else { return };
-        let Resuming { session, mut child, cwd, config_dir } = self.resuming.take().expect("checked above");
+        let Resuming { launch, mut child, cwd, config_dir } = self.resuming.take().expect("checked above");
         let mut out = String::new();
         if let Some(mut o) = child.stdout.take() {
             let _ = std::io::Read::read_to_string(&mut o, &mut out);
@@ -197,16 +209,25 @@ impl App {
             let _ = std::io::Read::read_to_string(&mut e, &mut out);
         }
         let said = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" · ");
-        self.note = match (status.success(), said.is_empty()) {
-            (true, _) if !bridge::queued(&self.bridge, &session).is_empty() => "resumed in the background: it takes the waiting prompt now".into(),
-            (true, true) => "resumed in the background: type a prompt".into(),
-            (true, false) => format!("resumed: {said}"),
-            (false, true) => format!("not resumed ({status})"),
-            (false, false) => bridge::resume_failed(&said, &config_dir, &cwd, &session),
+        let queued = |s: &str| !bridge::queued(&self.bridge, s).is_empty();
+        self.note = match (status.success(), said.is_empty(), &launch) {
+            (true, _, Launch::New(_)) => match bridge::started_id(&said) {
+                Some(id) => {
+                    self.select_started = Some(id.to_string());
+                    format!("started {id} in {}: selected once its first turn shows", bridge::tilde(&cwd))
+                }
+                None => format!("started: {said}"),
+            },
+            (true, _, Launch::Resume(s)) if queued(s) => "resumed in the background: it takes the waiting prompt now".into(),
+            (true, true, _) => "resumed in the background: type a prompt".into(),
+            (true, false, _) => format!("resumed: {said}"),
+            (false, true, Launch::Resume(_)) => format!("not resumed ({status})"),
+            (false, true, Launch::New(_)) => format!("not started ({status})"),
+            (false, false, _) => bridge::launch_failed(&said, &config_dir, &cwd, &launch),
         };
         if !status.success() && bridge::needs_terminal(&said) {
             // The keys go back to the tree, where o runs it here.
-            (self.here_for, self.typing) = (Some(Here { session, cwd, config_dir }), false);
+            (self.here_for, self.typing) = (Some(Here { launch, cwd, config_dir }), false);
         }
     }
 
@@ -331,7 +352,7 @@ impl App {
         self.note = match (bridge::send(&self.bridge, session, &message), stopped) {
             (Ok(true), _) => "sent".into(),
             // No process holds it: resume it, and its waiter takes the prompt.
-            (Ok(false), Some(_)) if self.resuming.as_ref().is_some_and(|r| r.session == session) => "queued; resuming it in the background…".into(),
+            (Ok(false), Some(_)) if self.resuming_for(session) => "queued; resuming it in the background…".into(),
             (Ok(false), Some(_)) if self.resuming.is_some() => "queued: the session is not running, and another is resuming; o resumes this one after".into(),
             (Ok(false), Some(a)) => format!("queued; {}", self.resume_in_background(&a)),
             (Ok(false), None) => "queued: nothing in the session listens now; it reads this when a turn of it ends (ctrl+x takes it back)".into(),
@@ -363,7 +384,7 @@ impl App {
     pub(super) fn panel_lines(&self, w: usize, h: usize) -> Vec<Line<'static>> {
         let orange = Style::new().fg(Color::Indexed(208));
         let Some(s) = self.panel_session() else { return vec![Line::styled("no session selected", faint())] };
-        let (state, style) = match (self.live, self.resuming.as_ref().is_some_and(|r| r.session == s.id)) {
+        let (state, style) = match (self.live, self.resuming_for(&s.id)) {
             (_, true) => ("resuming…", faint()),
             (true, _) => ("running", Style::new().fg(status_color(Status::Running))),
             (false, _) => ("not running · o resumes it", faint()),
@@ -425,11 +446,29 @@ impl App {
             }
             Some(a) => {
                 let text: Vec<char> = format!("asks: {}", a.summary).chars().collect();
-                for c in text.chunks(w.max(1)).take(2) {
+                for c in text.chunks(w.max(1)).take(if a.detail.is_empty() { 2 } else { 1 }) {
                     out.push(Line::styled(c.iter().collect::<String>(), orange.add_modifier(Modifier::BOLD)));
                 }
+                // The whole call, each line wrapped: an edit's - and + lines coloured as a diff.
+                let mut call: Vec<Line<'static>> = Vec::new();
+                for l in &a.detail {
+                    let style = match l.chars().next() {
+                        Some('-') if l.starts_with("- ") => Style::new().fg(Color::Indexed(174)),
+                        Some('+') if l.starts_with("+ ") => Style::new().fg(Color::Indexed(114)),
+                        _ => Style::new(),
+                    };
+                    call.extend(wrap(&format!("  {l}"), w).into_iter().map(|r| Line::styled(r, style)));
+                }
+                if call.len() > ASKING_LINES {
+                    let more = call.len() - (ASKING_LINES - 1);
+                    call.truncate(ASKING_LINES - 1);
+                    call.push(Line::styled(format!("  … {more} more lines"), faint()));
+                }
+                out.extend(call);
                 let left = bridge::HOLD.saturating_sub(SystemTime::now().duration_since(a.at).unwrap_or_default()).as_secs();
                 out.push(Line::raw(truncate("1 yes · 2 yes, don't ask again · 3 no", w)));
+                let saves = if a.rules.is_empty() { "2 saves no rule: Claude Code offered none".to_string() } else { format!("2 saves: {}", a.rules.join(", ")) };
+                out.extend(wrap(&saves, w).into_iter().map(|l| Line::styled(l, faint())));
                 out.push(Line::styled(truncate(&format!("or in its own dialog · answerable here {}m more", left.div_ceil(60)), w), faint()));
             }
             None if !s.asking.is_empty() => {

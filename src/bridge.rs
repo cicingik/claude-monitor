@@ -49,6 +49,8 @@ pub struct Ask {
     pub summary: String, // the tool call, as the tree shows tool calls
     pub at: SystemTime,  // when it was filed
     pub questions: Vec<Question>, // AskUserQuestion's: answered by picking, not by yes or no
+    pub detail: Vec<String>, // the whole call, a line each: see detail()
+    pub rules: Vec<String>,  // what "don't ask again" saves: see rules()
 }
 
 /// One question of an AskUserQuestion call.
@@ -134,6 +136,12 @@ pub fn leave(root: &Path) {
     let _ = fs::remove_file(root.join("alive"));
 }
 
+/// Whether the hook that filed ask-<id>.json still waits for its answer: a
+/// hook killed with its session leaves its file behind.
+fn hook_alive(id: &str) -> bool {
+    !cfg!(unix) || id.parse().is_ok_and(alive_pid)
+}
+
 /// The oldest permission request of session waiting for an answer.
 pub fn ask(root: &Path, session: &str) -> Option<Ask> {
     let d = session_dir(root, session);
@@ -144,10 +152,15 @@ pub fn ask(root: &Path, session: &str) -> Option<Ask> {
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
             let id = name.strip_prefix("ask-")?.strip_suffix(".json")?.to_string();
+            if !hook_alive(&id) {
+                return None;
+            }
             let v: Value = serde_json::from_slice(&fs::read(e.path()).ok()?).ok()?;
             let at = e.metadata().and_then(|m| m.modified()).ok()?;
             let qs = v.get("questions").map(|q| questions(&json!({ "questions": q }))).unwrap_or_default();
-            Some(Ask { id, summary: v.get("summary")?.as_str()?.to_string(), at, questions: qs })
+            let tool = v.get("tool").and_then(Value::as_str).unwrap_or("");
+            let (detail, rules) = (detail(tool, v.get("input").unwrap_or(&Value::Null)), rules(v.get("suggestions").unwrap_or(&Value::Null)));
+            Some(Ask { id, summary: v.get("summary")?.as_str()?.to_string(), at, questions: qs, detail, rules })
         })
         .collect();
     asks.sort_by_key(|a| a.at);
@@ -264,7 +277,9 @@ fn permission(d: &Path, root: &Path, v: &Value) -> Option<String> {
     let (ask, ans) = (d.join(format!("ask-{id}.json")), d.join(format!("answer-{id}.json")));
     let qs = if tool == "AskUserQuestion" { v.get("tool_input").and_then(|i| i.get("questions")).cloned() } else { None };
     let agent = v.get("agent_id").and_then(Value::as_str).unwrap_or("");
-    put(&ask, json!({ "summary": summary, "questions": qs, "agent": agent }).to_string().as_bytes()).ok()?;
+    let (input, suggestions) = (v.get("tool_input").cloned().unwrap_or(Value::Null), v.get("permission_suggestions").cloned().unwrap_or(Value::Null));
+    let filed = json!({ "summary": summary, "questions": qs, "agent": agent, "tool": tool, "input": input, "suggestions": suggestions });
+    put(&ask, filed.to_string().as_bytes()).ok()?;
     // Claude Code shows its own dialog meanwhile and leaves this hook running
     // when it is answered there: the call's tool_result in the transcript of
     // the agent that asked says so.
@@ -301,6 +316,59 @@ fn transcript(v: &Value) -> Option<PathBuf> {
         Some(agent) => Some(session.with_extension("").join("subagents").join(format!("agent-{agent}.jsonl"))),
         None => Some(session),
     }
+}
+
+/// The whole of a tool call a permission request is for, a line each, as
+/// the panel shows it: a command as written; an edit's file, then its old
+/// lines after `- ` and new ones after `+ `; a write's file, then its lines;
+/// anything else as `key: value`.
+pub fn detail(tool: &str, input: &Value) -> Vec<String> {
+    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let lines = |prefix: &str, text: &str| text.lines().map(|l| format!("{prefix}{l}")).collect::<Vec<_>>();
+    let edit = |e: &Value| [lines("- ", &s(e, "old_string")), lines("+ ", &s(e, "new_string"))].concat();
+    match tool {
+        "Bash" => lines("", &s(input, "command")),
+        "Edit" => [vec![s(input, "file_path")], edit(input)].concat(),
+        "MultiEdit" => {
+            let edits = input.get("edits").and_then(Value::as_array).into_iter().flatten();
+            std::iter::once(s(input, "file_path")).chain(edits.flat_map(edit)).collect()
+        }
+        "Write" => [vec![s(input, "file_path")], lines("+ ", &s(input, "content"))].concat(),
+        _ => input
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(k, v)| format!("{k}: {}", v.as_str().map_or_else(|| v.to_string(), str::to_string)))
+            .collect(),
+    }
+}
+
+/// What answering "yes, don't ask again" saves, from the request's
+/// permission_suggestions: `Bash(npm test:*) (this project)`, a folder it
+/// may use, or a permission mode, each with where it is saved.
+pub fn rules(suggestions: &Value) -> Vec<String> {
+    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let mut out = Vec::new();
+    for u in suggestions.as_array().into_iter().flatten() {
+        let place = match s(u, "destination").as_str() {
+            "session" => " (this session)",
+            "localSettings" => " (this project, just you)",
+            "projectSettings" => " (this project)",
+            "userSettings" => " (all projects)",
+            _ => "",
+        };
+        let what: Vec<String> = match s(u, "type").as_str() {
+            "addRules" | "replaceRules" => u.get("rules").and_then(Value::as_array).into_iter().flatten().map(|r| match s(r, "ruleContent") {
+                c if c.is_empty() => s(r, "toolName"),
+                c => format!("{}({c})", s(r, "toolName")),
+            }).collect(),
+            "addDirectories" => u.get("directories").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(|d| format!("folder {}", tilde(d))).collect(),
+            "setMode" => vec![format!("mode {}", s(u, "mode"))],
+            t => vec![t.to_string()],
+        };
+        out.extend(what.into_iter().filter(|w| !w.is_empty()).map(|w| format!("{w}{place}")));
+    }
+    out
 }
 
 /// The PermissionRequest hook's output for office's answer.
@@ -475,8 +543,7 @@ pub fn overlay(snap: &mut crate::scan::Snapshot, root: &Path) {
         for e in fs::read_dir(d.path()).into_iter().flatten().flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             let Some(pid) = name.strip_prefix("ask-").and_then(|n| n.strip_suffix(".json")) else { continue };
-            // A hook killed with its session leaves its file behind.
-            if cfg!(unix) && !pid.parse().is_ok_and(alive_pid) {
+            if !hook_alive(pid) {
                 continue;
             }
             let Ok(v) = serde_json::from_slice::<Value>(&fs::read(e.path()).unwrap_or_default()) else { continue };
@@ -551,6 +618,18 @@ fn claude(program: &Path, config_dir: &Path, cwd: &str) -> io::Result<process::C
     Ok(cmd)
 }
 
+/// Whether the account of config_dir trusts folder itself, as `claude --bg`
+/// wants it (a trusted parent folder is not enough there): its
+/// projects.<folder>.hasTrustDialogAccepted, in ~/.claude.json for ~/.claude,
+/// else in <config_dir>/.claude.json.
+pub fn trusts(config_dir: &Path, folder: &str) -> bool {
+    let home = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default();
+    let file = if config_dir == home.join(".claude") { home.join(".claude.json") } else { config_dir.join(".claude.json") };
+    let Ok(b) = fs::read(file) else { return false };
+    let v: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
+    v.get("projects").and_then(|p| p.get(folder.trim_end_matches('/'))).and_then(|p| p.get("hasTrustDialogAccepted")).and_then(Value::as_bool) == Some(true)
+}
+
 fn not_on_path(e: io::Error) -> io::Error {
     match e.kind() {
         io::ErrorKind::NotFound => io::Error::new(e.kind(), "`claude` is not on PATH"),
@@ -558,23 +637,49 @@ fn not_on_path(e: io::Error) -> io::Error {
     }
 }
 
-/// Starts `claude --resume <session> --bg` in cwd under config_dir: Claude
-/// Code's own background session, needing no terminal (`claude attach` shows
-/// it). It returns once the session started; its output says how it went.
-pub fn resume(program: &Path, config_dir: &Path, cwd: &str, session: &str) -> io::Result<process::Child> {
-    let id = session.split('@').next().unwrap_or(session);
+/// What office starts `claude` for: a session to resume (its id, as the
+/// scan names it), or a new one with its first prompt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Launch {
+    Resume(String),
+    New(String),
+}
+
+impl Launch {
+    /// claude's arguments for it. A prompt follows `--`, so one such as
+    /// `logs` or `-v` is a prompt, not a command or a flag of claude's.
+    fn args(&self) -> Vec<&str> {
+        match self {
+            Launch::Resume(session) => vec!["--resume", session.split('@').next().unwrap_or(session)],
+            Launch::New(prompt) => vec!["--", prompt],
+        }
+    }
+}
+
+/// Starts claude for launch in the background (`--bg`) in cwd under
+/// config_dir: Claude Code's own background session, needing no terminal
+/// (`claude attach` shows it). It returns once the session started; its
+/// output says how it went.
+pub fn start(program: &Path, config_dir: &Path, cwd: &str, launch: &Launch) -> io::Result<process::Child> {
     let mut cmd = claude(program, config_dir, cwd)?;
-    cmd.args(["--resume", id, "--bg"]).stdin(process::Stdio::null()).stdout(process::Stdio::piped()).stderr(process::Stdio::piped());
+    cmd.arg("--bg").args(launch.args()).stdin(process::Stdio::null()).stdout(process::Stdio::piped()).stderr(process::Stdio::piped());
     cmd.spawn().map_err(not_on_path)
 }
 
-/// Runs `claude --resume <session>` in this terminal until it exits: for
-/// what a background session cannot do, such as asking whether to trust its
+/// Runs claude for launch in this terminal until it exits: for what a
+/// background session cannot do, such as asking whether to trust its
 /// folder. The caller hands the terminal over first and takes it back after.
-pub fn resume_here(program: &Path, config_dir: &Path, cwd: &str, session: &str) -> io::Result<process::ExitStatus> {
-    let id = session.split('@').next().unwrap_or(session);
+pub fn run_here(program: &Path, config_dir: &Path, cwd: &str, launch: &Launch) -> io::Result<process::ExitStatus> {
     let mut cmd = claude(program, config_dir, cwd)?;
-    cmd.args(["--resume", id]).status().map_err(not_on_path)
+    cmd.args(launch.args()).status().map_err(not_on_path)
+}
+
+/// The short id `claude --bg` names the session it started with:
+/// "backgrounded · f328bbdc (idle — …)".
+pub fn started_id(said: &str) -> Option<&str> {
+    let rest = said.split("backgrounded · ").nth(1)?;
+    let id = rest.split(|c: char| !c.is_ascii_alphanumeric() && c != '-').next()?;
+    (!id.is_empty()).then_some(id)
 }
 
 /// Whether a failed background resume needs a terminal: Claude Code wants
@@ -583,31 +688,35 @@ pub fn needs_terminal(said: &str) -> bool {
     said.contains("Workspace not trusted")
 }
 
-/// What to tell the user when `claude --resume --bg` failed, from what it
+/// What to tell the user when `claude --bg` failed for launch, from what it
 /// said: its reason, and for a folder this account has not trusted, the
 /// command that trusts it (Claude Code's own dialog; office never trusts a
 /// folder itself).
-pub fn resume_failed(said: &str, config_dir: &Path, cwd: &str, session: &str) -> String {
+pub fn launch_failed(said: &str, config_dir: &Path, cwd: &str, launch: &Launch) -> String {
     let home = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default();
     let account = if config_dir == home.join(".claude") { String::new() } else { format!("CLAUDE_CONFIG_DIR={} ", tilde(&config_dir.to_string_lossy())) };
-    let id = session.split('@').next().unwrap_or(session);
+    let (not, it, claude) = match launch {
+        Launch::Resume(s) => ("not resumed", "it was started in", format!("claude --resume {}", s.split('@').next().unwrap_or(s))),
+        Launch::New(_) => ("not started", "it is", "claude".to_string()),
+    };
     if said.contains("is your home directory") {
         return format!(
-            "not resumed: it was started in your home directory, and Claude Code never runs those in the background (it never saves trust for home). Press o to run it here (office comes back when you exit Claude), or in a terminal: cd ~ && {account}claude --resume {id}"
+            "{not}: {it} your home directory, and Claude Code never runs those in the background (it never saves trust for home). Press o to run it here (office comes back when you exit Claude), or in a terminal: cd ~ && {account}{claude}"
         );
     }
     if said.contains("Workspace not trusted") {
         return format!(
-            "not resumed: {} is not trusted for this account yet. Press o to run it here and accept the trust prompt (office comes back when you exit Claude), or run this once in a terminal: cd {} && {account}claude",
+            "{not}: {} is not trusted for {} yet (a trusted parent folder is not enough in the background). Press o to run it here and accept the trust prompt (office comes back when you exit Claude), or run this once in a terminal: cd {} && {account}claude",
             tilde(cwd),
+            tilde(&config_dir.to_string_lossy()),
             tilde(cwd)
         );
     }
-    format!("not resumed: {said}")
+    format!("{not}: {said}")
 }
 
 /// path with the home directory written as ~.
-fn tilde(path: &str) -> String {
+pub(crate) fn tilde(path: &str) -> String {
     let home = env::var("HOME").unwrap_or_default();
     match path.strip_prefix(&home) {
         Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => format!("~{rest}"),
@@ -815,6 +924,9 @@ mod tests {
         assert_eq!((snap.by_id["a7"].status, snap.by_id["a7"].last_tool.as_str()), (Status::Waiting, "Bash: make"));
         assert_eq!(snap.by_id["a8"].status, Status::Running);
         assert_eq!(snap.by_id["s1@work"].status, Status::Running, "its hook is gone");
+        assert_eq!(ask(&root, "s1").map(|a| a.summary), Some("Bash: make".into()), "the panel asks only what a live hook waits on");
+        fs::remove_file(root.join("s1").join(format!("ask-{me}.json"))).unwrap();
+        assert_eq!(ask(&root, "s1"), None, "a dead hook's question is not asked");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -826,14 +938,60 @@ mod tests {
         let (work, dflt) = (home.join(".claude-work"), home.join(".claude"));
         let cwd = home.join("dev").join("api").to_string_lossy().into_owned();
         let said = format!("Workspace not trusted. Run `claude` in {cwd} once and accept the trust prompt, then retry.");
-        let m = resume_failed(&said, &work, &cwd, "s1@work");
-        assert!(m.contains("~/dev/api is not trusted for this account") && m.contains("Press o to run it here") && m.ends_with("cd ~/dev/api && CLAUDE_CONFIG_DIR=~/.claude-work claude"), "{m}");
+        let (s1, s1_work, new) = (Launch::Resume("s1".into()), Launch::Resume("s1@work".into()), Launch::New("hi".into()));
+        let m = launch_failed(&said, &work, &cwd, &s1_work);
+        assert!(m.contains("~/dev/api is not trusted for ~/.claude-work yet") && m.contains("Press o to run it here") && m.ends_with("cd ~/dev/api && CLAUDE_CONFIG_DIR=~/.claude-work claude"), "{m}");
         assert!(needs_terminal(&said) && !needs_terminal("boom"));
-        assert!(resume_failed(&said, &dflt, &cwd, "s1").ends_with("cd ~/dev/api && claude"), "the default account needs no CLAUDE_CONFIG_DIR");
-        let m = resume_failed(&format!("Error: Workspace not trusted. {} is your home directory, and ...", home.display()), &work, &home.to_string_lossy(), "s1@work");
+        assert!(launch_failed(&said, &dflt, &cwd, &s1).ends_with("cd ~/dev/api && claude"), "the default account needs no CLAUDE_CONFIG_DIR");
+        assert!(launch_failed(&said, &work, &cwd, &new).starts_with("not started: ~/dev/api is not trusted"));
+        let at_home = format!("Error: Workspace not trusted. {} is your home directory, and ...", home.display());
+        let m = launch_failed(&at_home, &work, &home.to_string_lossy(), &s1_work);
         assert!(m.contains("home directory") && m.ends_with("cd ~ && CLAUDE_CONFIG_DIR=~/.claude-work claude --resume s1"), "{m}");
-        assert_eq!(resume_failed("boom", &work, &cwd, "s1"), "not resumed: boom");
-        let gone = resume(Path::new("claude"), &work, "/nonexistent/office-gone", "s1").unwrap_err();
+        let m = launch_failed(&at_home, &work, &home.to_string_lossy(), &new);
+        assert!(m.starts_with("not started: it is your home directory") && m.ends_with("cd ~ && CLAUDE_CONFIG_DIR=~/.claude-work claude"), "{m}");
+        assert_eq!(launch_failed("boom", &work, &cwd, &s1), "not resumed: boom");
+        let gone = start(Path::new("claude"), &work, "/nonexistent/office-gone", &s1).unwrap_err();
         assert_eq!(gone.to_string(), "its folder /nonexistent/office-gone no longer exists");
+    }
+
+    /// A request shows its whole call, an edit as a diff, and what "don't
+    /// ask again" saves, where.
+    #[test]
+    fn a_request_shows_its_whole_call_and_what_always_saves() {
+        assert_eq!(detail("Bash", &json!({ "command": "cargo build &&\n  cargo test" })), ["cargo build &&", "  cargo test"]);
+        let edit = json!({ "file_path": "/p/a.rs", "old_string": "x\ny", "new_string": "z" });
+        assert_eq!(detail("Edit", &edit), ["/p/a.rs", "- x", "- y", "+ z"]);
+        assert_eq!(detail("WebFetch", &json!({ "url": "https://x", "n": 2 })), ["url: https://x", "n: 2"], "in the call's own order");
+        let s = json!([
+            { "type": "addRules", "rules": [{ "toolName": "Bash", "ruleContent": "npm test:*" }, { "toolName": "Read" }], "behavior": "allow", "destination": "projectSettings" },
+            { "type": "addDirectories", "directories": ["/tmp/x"], "destination": "session" },
+            { "type": "setMode", "mode": "acceptEdits", "destination": "session" },
+        ]);
+        assert_eq!(rules(&s), ["Bash(npm test:*) (this project)", "Read (this project)", "folder /tmp/x (this session)", "mode acceptEdits (this session)"]);
+        assert!(rules(&Value::Null).is_empty());
+    }
+
+    /// An account trusts the folders its .claude.json accepted the trust
+    /// dialog for, and only those: not their subfolders.
+    #[test]
+    fn an_account_trusts_only_the_folders_it_accepted() {
+        let cfg = tmp("trust");
+        fs::create_dir_all(&cfg).unwrap();
+        let v = json!({ "projects": { "/p": { "hasTrustDialogAccepted": true }, "/q": { "hasTrustDialogAccepted": false } } });
+        fs::write(cfg.join(".claude.json"), v.to_string()).unwrap();
+        assert!(trusts(&cfg, "/p") && trusts(&cfg, "/p/"));
+        assert!(!trusts(&cfg, "/p/sub") && !trusts(&cfg, "/q") && !trusts(&cfg, "/r"));
+        assert!(!trusts(&cfg.join("none"), "/p"), "no such account");
+        let _ = fs::remove_dir_all(&cfg);
+    }
+
+    /// A new session's prompt goes after `--`, so claude never takes it for
+    /// a command or a flag; `--bg` names what it started.
+    #[test]
+    fn a_new_session_starts_with_its_prompt() {
+        assert_eq!(Launch::New("logs".into()).args(), ["--", "logs"]);
+        assert_eq!(Launch::Resume("s1@work".into()).args(), ["--resume", "s1"]);
+        assert_eq!(started_id("backgrounded · f328bbdc (idle — send a prompt to start)\n  claude agents"), Some("f328bbdc"));
+        assert_eq!(started_id("Workspace not trusted."), None);
     }
 }

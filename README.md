@@ -396,6 +396,7 @@ your settings allow without asking.
 | `1` `2` `3`       | Activity, Interactions, Usage |
 | `p`               | type in the prompt panel   |
 | `o`               | resume the selected session in the background, then type in its panel |
+| `n`               | start a [new session](#new-session) in a folder you pick |
 | mouse drag        | select text inside one pane (tree, prompt or details) and copy it to the clipboard on release, through the terminal (OSC 52; in tmux, `set -g set-clipboard on`) |
 | `v`               | switch to the office view  |
 | `r`               | drop all state and rescan  |
@@ -430,7 +431,9 @@ newest at the bottom (your prompts after `>`, its replies after `●`, whole and
 wrapped, its tool calls on one line each, prompts sent from office included;
 prompts the session has not taken yet show last, dim, marked not taken yet),
 and you type in a rounded box under it. What the session waits on sits just
-over the box: a permission request (`asks: Bash: rm -rf build`), a question
+over the box: a permission request (`asks: Bash: rm -rf build`, then the
+whole call: the full command, an edit's file with its removed and added lines,
+and what `2` saves, such as `2 saves: Bash(npm test:*) (this project)`), a question
 with its numbered options (asked one at a time when there are several), or a
 plan waiting for approval.
 
@@ -464,6 +467,21 @@ home directory). The panel then says so, with the command that trusts it, and
 Claude Code's trust prompt there and use the session; office comes back when
 you exit Claude. Once trusted, `o` resumes it in the background. office
 never marks a folder trusted itself.
+
+## New session
+
+`n` in the tree opens a picker over it. Pick the folder from those your
+sessions ran in, most recent first (type to filter, `↑`/`↓` to pick), or type
+a path starting with `/` or `~` (`tab` completes it). `ctrl+t` switches the
+account, starting with the selected session's. `enter` takes the folder, then
+type the first prompt: `enter` starts `claude --bg -- <prompt>` there, so the
+prompt reaches the session as your own message. A session writes nothing
+before its first prompt, so it needs one to show in the tree. It is selected,
+with its panel taking the keys, once a scan shows it. `esc` goes back a step.
+
+A folder the account has not trusted yet (or your home directory) cannot
+start in the background: the note says so, and `o` starts it right in
+office's terminal instead, where you answer Claude Code's trust prompt.
 
 How it works (files in `$XDG_STATE_HOME/claude-monitor/bridge`, else
 `~/.local/state/claude-monitor/bridge`):

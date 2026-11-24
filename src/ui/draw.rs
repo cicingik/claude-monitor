@@ -88,7 +88,11 @@ impl App {
         let panel = Rect::new(area.x, area.y + 1 + tree_h, lw, panel_h.min(body_h - tree_h));
         let right = Rect::new(area.x + lw, area.y + 1, rw, body_h);
         self.panes.set([left, panel, right].map(|r| r.inner(Margin::new(1, 1))));
-        f.render_widget(Paragraph::new(self.tree_lines(usize::from(lw.saturating_sub(2)))).block(block()), left);
+        let (tw, th) = (usize::from(lw.saturating_sub(2)), usize::from(tree_h.saturating_sub(2)));
+        match &self.picker {
+            Some(_) => f.render_widget(Paragraph::new(self.picker_lines(tw, th)).block(block().border_style(Style::new().fg(Color::Indexed(208)))), left),
+            None => f.render_widget(Paragraph::new(self.tree_lines(tw)).block(block()), left),
+        }
         let edge = if self.typing { Color::Indexed(208) } else { Color::Indexed(240) };
         let title = Span::styled(" prompt ", Style::new().fg(edge));
         let panel_block = block().border_style(Style::new().fg(edge)).title(title);
@@ -97,10 +101,14 @@ impl App {
         if rw > 2 {
             f.render_widget(Paragraph::new(self.detail_lines(usize::from(rw - 2))).block(block()), right);
         }
-        let keys: &[(&str, &str)] = if self.typing {
+        let keys: &[(&str, &str)] = if self.picker.as_ref().is_some_and(|p| p.picked()) {
+            &[("enter", "start it"), ("ctrl+t", "account"), ("esc", "another folder"), ("ctrl+c", "quit")]
+        } else if self.picker.is_some() {
+            &[("↑/↓", "pick"), ("tab", "complete"), ("enter", "this folder"), ("ctrl+t", "account"), ("esc", "close"), ("ctrl+c", "quit")]
+        } else if self.typing {
             &[("enter", "send prompt"), ("/", "commands, tab completes"), ("←/→", "cursor"), ("pgup/pgdn", "scroll"), ("digits", "answer (empty prompt)"), ("↑/↓", "history"), ("ctrl+x", "take back a waiting prompt"), ("esc", "back to tree"), ("ctrl+c", "quit")]
         } else {
-            &[("↑/k", "up"), ("↓/j", "down"), ("enter", "collapse/expand"), ("p", "prompt"), ("o", "resume session"), ("tab", "next tab"), ("1-3", "tab"), ("v", "office"), ("r", "rescan"), ("q", "quit")]
+            &[("↑/k", "up"), ("↓/j", "down"), ("enter", "collapse/expand"), ("p", "prompt"), ("o", "resume session"), ("n", "new session"), ("tab", "next tab"), ("1-3", "tab"), ("v", "office"), ("r", "rescan"), ("q", "quit")]
         };
         Self::line(f, area, area.y + 1 + body_h, help(keys));
     }

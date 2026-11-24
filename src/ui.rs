@@ -19,7 +19,7 @@ use ratatui::{
 
 use crate::{
     actors::{self, Scene, Walker},
-    bridge::{self, Ask},
+    bridge::{self, Ask, Launch},
     cast::Cast,
     commands::Command,
     edit::LineEdit,
@@ -29,6 +29,7 @@ use crate::{
 
 mod card;
 mod draw;
+mod new;
 mod panel;
 mod select;
 
@@ -52,11 +53,11 @@ pub enum Action {
     RunHere(Here), // hand the terminal to `claude --resume` until it exits
 }
 
-/// A session to resume in office's own terminal, for what a background
-/// session cannot do: ask whether to trust its folder.
+/// A session to resume or start in office's own terminal, for what a
+/// background session cannot do: ask whether to trust its folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Here {
-    pub session: String,
+    pub launch: Launch,
     pub cwd: String,
     pub config_dir: PathBuf,
 }
@@ -106,6 +107,8 @@ pub struct App {
     panes: Cell<[Rect; 3]>, // the insides of the tree, prompt and detail panes, as last drawn
     pub copied: Option<String>, // selected text for main to put on the clipboard
     here_for: Option<Here>, // the session whose background resume needs a terminal: o runs it here
+    picker: Option<new::Picker>, // the new-session picker over the tree, while open
+    select_started: Option<String>, // a session office started: selected once a scan shows it
 }
 
 /// A walk through the session's project's prompts: the prompt at shows,
@@ -116,9 +119,9 @@ struct Recall {
     draft: String,
 }
 
-/// A `claude --resume --bg` until it returns, and what explains its result.
+/// A `claude --bg` until it returns, and what explains its result.
 struct Resuming {
-    session: String,
+    launch: Launch,
     child: std::process::Child,
     cwd: String,
     config_dir: PathBuf,
@@ -209,6 +212,8 @@ impl App {
             panes: Cell::new([Rect::default(); 3]),
             copied: None,
             here_for: None,
+            picker: None,
+            select_started: None,
         }
     }
 
@@ -223,7 +228,11 @@ impl App {
     }
 
     pub fn set_snapshot(&mut self, snap: Snapshot) {
+        let started = self.select_started.as_ref().and_then(|short| snap.roots.iter().find(|id| id.starts_with(short.as_str())).cloned());
         self.snap = Some(snap);
+        if let Some(id) = started {
+            (self.selected, self.select_started, self.typing) = (id, None, true);
+        }
         self.sync_cursor();
     }
 
@@ -258,10 +267,30 @@ impl App {
         self.scene = sc;
     }
 
+    /// A paste, whole: into the picker's input (a folder holds no line
+    /// break, so its breaks go), else into the prompt while the panel has
+    /// the keys, line breaks kept. Elsewhere it is dropped: pasted text
+    /// never runs the tree's keys.
+    pub fn paste(&mut self, text: &str) {
+        self.selection = None;
+        if self.view != View::Tree {
+            return;
+        }
+        if let Some(p) = self.picker.as_mut() {
+            p.paste(&text.replace(['\r', '\n'], ""));
+        } else if self.typing {
+            self.input.insert(text);
+            (self.menu_at, self.recall) = (0, None);
+        }
+    }
+
     /// Handles a key press.
     pub fn key(&mut self, k: KeyEvent) -> Action {
         self.selection = None;
         let ctrl_c = k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
+        if self.picker.is_some() && self.view == View::Tree && !ctrl_c {
+            return self.picker_key(k);
+        }
         if self.typing && self.view == View::Tree && !ctrl_c {
             return self.panel_key(k);
         }
@@ -342,6 +371,7 @@ impl App {
             KeyCode::Tab => self.tab = (self.tab + 1) % TABS.len(),
             KeyCode::Char('p') => self.typing = true,
             KeyCode::Char('o') => return self.resume(),
+            KeyCode::Char('n') => self.open_picker(),
             KeyCode::Char(c @ '1'..='3') => self.tab = c as usize - '1' as usize,
             KeyCode::Char('v') => {
                 self.view = View::Office;
@@ -713,14 +743,14 @@ mod tests {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        app.resuming = Some(Resuming { session: "s1".into(), child, cwd: "/tmp".into(), config_dir: "/cfg".into() });
+        app.resuming = Some(Resuming { launch: Launch::Resume("s1".into()), child, cwd: "/tmp".into(), config_dir: "/cfg".into() });
         while app.resuming.is_some() {
             app.poll_resume();
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(app.note.contains("/tmp is not trusted") && app.note.contains("Press o to run it here"), "{}", app.note);
         assert!(!app.typing, "o is a key of the tree again");
-        let want = Here { session: "s1".into(), cwd: "/tmp".into(), config_dir: "/cfg".into() };
+        let want = Here { launch: Launch::Resume("s1".into()), cwd: "/tmp".into(), config_dir: "/cfg".into() };
         assert_eq!(press(&mut app, KeyCode::Char('o')), Action::RunHere(want.clone()));
         app.ran_here(&want, Ok(std::process::Command::new("true").status().unwrap()));
         assert!(app.note.starts_with("back from s1"), "{}", app.note);
@@ -751,10 +781,77 @@ mod tests {
             app.poll_resume();
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert_eq!(std::fs::read_to_string(&said).unwrap().trim(), "--resume s1 --bg");
+        assert_eq!(std::fs::read_to_string(&said).unwrap().trim(), "--bg --resume s1");
         assert_eq!(app.note, "resumed in the background: it takes the waiting prompt now");
         assert_eq!(bridge::queued(&root.join("bridge"), "s1").len(), 1, "the prompt waits for the resumed session's waiter");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// n opens the picker over the tree: enter takes the folder a session
+    /// ran in, the first prompt starts `claude --bg -- <prompt>` there, and
+    /// the new session is selected, its panel typing, once a scan shows it.
+    #[test]
+    fn n_starts_a_new_session_in_a_picked_folder() {
+        let root = std::env::temp_dir().join(format!("office-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let (fake, said) = (root.join("claude"), root.join("args"));
+        std::fs::write(&fake, format!("#!/bin/sh\necho \"$@\" > {}\necho 'backgrounded · abcd1234 (idle — send a prompt to start)'\n", said.display())).unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let mut app = App::new(0, 1);
+        (app.bridge, app.hooks, app.claude, app.view) = (root.join("bridge"), true, fake, View::Tree);
+        let mut snap = busy_snap();
+        let s1 = snap.by_id.get_mut("s1").unwrap();
+        (s1.cwd, s1.config_dir) = (proj.to_string_lossy().into_owned(), root.join("cfg"));
+        app.set_snapshot(snap.clone());
+        app.selected = "s1".into();
+        press(&mut app, KeyCode::Char('n'));
+        let text = app.picker_lines(60, 20).iter().map(Line::to_string).collect::<Vec<_>>();
+        assert!(text[0] == "new session" && text.iter().any(|l| l.trim() == crate::bridge::tilde(&proj.to_string_lossy())), "{text:#?}");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.note.starts_with("type the first prompt"), "{}", app.note);
+        for c in "logs".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(app.picker.is_none() && app.note.starts_with("starting a session in"), "{}", app.note);
+        while app.resuming.is_some() {
+            app.poll_resume();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read_to_string(&said).unwrap().trim(), "--bg -- logs", "the prompt is never a command of claude's");
+        assert!(app.note.starts_with("started abcd1234"), "{}", app.note);
+        let new = agent("abcd1234-0000@work", "", Status::Running);
+        snap.roots.insert(0, new.id.clone());
+        snap.by_id.insert(new.id.clone(), new);
+        app.set_snapshot(snap);
+        assert_eq!((app.selected.as_str(), app.typing), ("abcd1234-0000@work", true));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A new session in a folder not trusted yet offers to start it here.
+    #[test]
+    fn an_untrusted_new_session_offers_to_start_it_here() {
+        let mut app = App::new(0, 1);
+        app.view = View::Tree;
+        app.set_snapshot(busy_snap());
+        let child = std::process::Command::new("sh")
+            .args(["-c", "echo 'Workspace not trusted. Run `claude` in /tmp once and accept the trust prompt, then retry.' >&2; exit 1"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let launch = Launch::New("hi".into());
+        app.resuming = Some(Resuming { launch: launch.clone(), child, cwd: "/tmp".into(), config_dir: "/cfg".into() });
+        while app.resuming.is_some() {
+            app.poll_resume();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(app.note.starts_with("not started: /tmp is not trusted"), "{}", app.note);
+        let want = Here { launch, cwd: "/tmp".into(), config_dir: "/cfg".into() };
+        assert_eq!(press(&mut app, KeyCode::Char('o')), Action::RunHere(want));
     }
 
     /// A long note wraps over several rows instead of being cut to one.
@@ -794,7 +891,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!("office-pick-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("s1")).unwrap();
-        std::fs::write(root.join("s1").join("ask-7.json"), r#"{"summary":"AskUserQuestion: Color?","questions":[
+        let me = std::process::id(); // a live hook's pid: a dead one's question is not asked
+        std::fs::write(root.join("s1").join(format!("ask-{me}.json")), r#"{"summary":"AskUserQuestion: Color?","questions":[
             {"question":"Color?","options":[{"label":"Red","description":"warm"},{"label":"Blue"}]},
             {"question":"Size?","options":[{"label":"S"},{"label":"L"}]}]}"#).unwrap();
         let mut app = App::new(0, 1);
@@ -814,7 +912,7 @@ mod tests {
             press(&mut app, KeyCode::Char(c));
         }
         press(&mut app, KeyCode::Enter);
-        let got: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("s1").join("answer-7.json")).unwrap()).unwrap();
+        let got: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("s1").join(format!("answer-{me}.json"))).unwrap()).unwrap();
         assert_eq!(got, serde_json::json!({ "answers": { "Color?": "Blue", "Size?": "medium" } }));
         assert!(bridge::queued(&root, "s1").is_empty(), "an answer, not a prompt");
         assert_eq!(app.note, "answered: Blue · medium");
@@ -1023,6 +1121,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A paste with line breaks is one prompt, sent on enter only: its
+    /// breaks show as ↵ and reach the session as they were. Into the
+    /// picker it is a path, its breaks gone; with the tree's keys it does nothing.
+    #[test]
+    fn a_paste_is_one_prompt_however_many_lines() {
+        let root = std::env::temp_dir().join(format!("office-paste-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut app = App::new(0, 1);
+        (app.bridge, app.hooks, app.view) = (root.clone(), true, View::Tree);
+        app.set_snapshot(busy_snap());
+        app.selected = "s1".into();
+        app.paste("q");
+        assert!(app.input.is_empty(), "the tree's keys take no paste");
+        press(&mut app, KeyCode::Char('p'));
+        app.paste("got error, not started:\r\nback when you exit");
+        assert!(bridge::queued(&root, "s1").is_empty(), "nothing sent before enter");
+        let text = app.panel_lines(80, 20).iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("got error, not started:↵back when you exit"), "{text}");
+        press(&mut app, KeyCode::Enter);
+        let sent = bridge::queued(&root, "s1");
+        assert!(sent.len() == 1 && sent[0].ends_with("got error, not started:\nback when you exit"), "{sent:?}");
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('n'));
+        app.paste("/tmp\n");
+        assert_eq!(app.picker.as_ref().map(|p| p.input_text()), Some("/tmp".to_string()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// p on an agent opens the tree on it with the panel taking keys: text
     /// (q too) builds the prompt, enter leaves it for its session, a digit
     /// on an empty prompt answers the session's permission request, esc
@@ -1046,13 +1172,20 @@ mod tests {
         assert!(app.input.is_empty() && app.note.starts_with("queued"), "{}", app.note);
 
         // A permission request filed by the hook; 2 is "yes, don't ask again".
-        std::fs::write(root.join("s1").join("ask-42.json"), r#"{"summary":"Bash: rm -rf build"}"#).unwrap();
+        let me = std::process::id(); // a live hook's pid: a dead one's request is not asked
+        let filed = serde_json::json!({
+            "summary": "Bash: rm -rf build", "tool": "Bash", "input": { "command": "rm -rf build &&\n  make" },
+            "suggestions": [{ "type": "addRules", "rules": [{ "toolName": "Bash", "ruleContent": "rm -rf build:*" }], "behavior": "allow", "destination": "localSettings" }],
+        });
+        std::fs::write(root.join("s1").join(format!("ask-{me}.json")), filed.to_string()).unwrap();
         app.poll_bridge();
         assert_eq!(app.ask.as_ref().map(|a| a.summary.as_str()), Some("Bash: rm -rf build"));
-        let text = app.panel_lines(60, 20).iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
+        let text = app.panel_lines(60, 30).iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
         assert!(text.contains("asks: Bash: rm -rf build") && text.contains("1 yes · 2 yes, don't ask again · 3 no"), "{text}");
+        assert!(text.contains("  rm -rf build &&\n    make"), "the whole call: {text}");
+        assert!(text.contains("2 saves: Bash(rm -rf build:*) (this project, just you)"), "{text}");
         press(&mut app, KeyCode::Char('2'));
-        assert_eq!(std::fs::read_to_string(root.join("s1").join("answer-42.json")).unwrap(), "always");
+        assert_eq!(std::fs::read_to_string(root.join("s1").join(format!("answer-{me}.json"))).unwrap(), "always");
         assert_eq!(press(&mut app, KeyCode::Esc), Action::None);
         assert!(!app.typing);
         assert_eq!(press(&mut app, KeyCode::Char('q')), Action::Quit, "the tree's keys again");

@@ -28,6 +28,9 @@ const ACTIVE_WINDOW: i64 = 30 * SEC;
 /// and for at most WAIT_WINDOW (past that the session was likely closed).
 const WAIT_QUIET: i64 = 3 * SEC;
 const WAIT_WINDOW: i64 = 3600 * SEC;
+/// A session quiet this long counts as inactive, though a Claude Code
+/// process still holds it: a terminal left open for days.
+pub const IDLE_LIMIT: i64 = 24 * 3600 * SEC;
 /// The longest reply or question kept whole.
 const MAX_TEXT: usize = 4000;
 
@@ -157,7 +160,7 @@ pub struct Agent {
     pub model_usage: BTreeMap<String, Usage>,
     pub events: Vec<Event>,    // newest last, at most MAX_EVENTS
     pub children: Vec<String>, // ids, oldest first
-    pub live: bool,            // a session a running Claude Code process holds, though its transcript may be quiet
+    pub live: bool,            // a session a running Claude Code process holds, quiet for at most IDLE_LIMIT
     pub continued: bool,       // its conversation moved on to another session id: nothing listens here
 }
 
@@ -300,7 +303,7 @@ impl Scanner {
                     }
                     let Ok(md) = e.metadata() else { continue };
                     let sid = name.trim_end_matches(".jsonl");
-                    if self.since > 0 && now - mtime(&md) > self.since && !held.contains(sid) {
+                    if self.since > 0 && now - mtime(&md) > self.since && !(held.contains(sid) && now - mtime(&md) <= IDLE_LIMIT) {
                         continue;
                     }
                     self.session(&mut snap, &mut seen, &root, &proj_dir, &proj_name, sid, &md, now);
@@ -310,7 +313,8 @@ impl Scanner {
         self.files.retain(|p, _| seen.contains(p));
         for id in &snap.roots {
             let a = snap.by_id.get_mut(id).expect("a root is an agent");
-            a.live = !a.continued && live.get(&a.config_dir).is_some_and(|held| held.contains(id.split('@').next().unwrap_or(id)));
+            let held = live.get(&a.config_dir).is_some_and(|held| held.contains(id.split('@').next().unwrap_or(id)));
+            a.live = !a.continued && held && now - a.last_activity <= IDLE_LIMIT;
         }
         let by_id = &snap.by_id;
         snap.roots.sort_by(|a, b| by_id[b].last_activity.cmp(&by_id[a].last_activity));
@@ -546,21 +550,24 @@ mod tests {
 
     /// A session a live process names in sessions/<pid>.json is live, even
     /// with its transcript older than `since`, as a background session
-    /// resumed hours after its last turn; one whose process is gone is not.
+    /// resumed hours after its last turn, until it has been quiet for
+    /// IDLE_LIMIT (a terminal left open for days); one whose process is
+    /// gone is not.
     #[test]
-    fn a_session_a_running_process_holds_is_live_however_quiet() {
+    fn a_session_a_running_process_holds_is_live_until_idle_limit() {
         let dir = std::env::temp_dir().join(format!("office-live-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let cfg = dir.join(".claude-work");
-        let line = r#"{"type":"user","timestamp":"2026-01-01T09:00:00Z","cwd":"/p","message":{"content":"hi"}}"#;
+        let line = r#"{"type":"user","cwd":"/p","message":{"content":"hi"}}"#; // no timestamp: last activity is the file's mtime
         for s in ["held", "gone"] {
             write(&cfg.join("projects").join("-p").join(format!("{s}.jsonl")), &[line]);
         }
         fs::create_dir_all(cfg.join("sessions")).unwrap();
         fs::write(cfg.join("sessions").join("1.json"), format!(r#"{{"pid":{},"sessionId":"held","kind":"bg"}}"#, std::process::id())).unwrap();
         fs::write(cfg.join("sessions").join("2.json"), r#"{"pid":999999999,"sessionId":"gone","kind":"bg"}"#).unwrap();
-        let now = mtime(&fs::metadata(cfg.join("projects").join("-p").join("held.jsonl")).unwrap()) + 48 * 3600 * SEC;
-        let snap = Scanner::new(vec![Root::new(cfg.join("projects"))], 24 * 3600 * SEC).scan(now);
+        let at = mtime(&fs::metadata(cfg.join("projects").join("-p").join("held.jsonl")).unwrap());
+        let now = at + 2 * 3600 * SEC;
+        let snap = Scanner::new(vec![Root::new(cfg.join("projects"))], 3600 * SEC).scan(now);
         assert_eq!(snap.roots, ["held"], "a quiet session no process holds is past `since`");
         assert!(snap.by_id["held"].live);
         let snap = Scanner::new(vec![Root::new(cfg.join("projects"))], 0).scan(now);
@@ -573,6 +580,11 @@ mod tests {
         fs::write(cfg.join("sessions").join("3.json"), format!(r#"{{"pid":{},"sessionId":"moved","kind":"interactive"}}"#, std::process::id())).unwrap();
         let snap = Scanner::new(vec![Root::new(cfg.join("projects"))], 0).scan(now);
         assert!(snap.by_id["held"].live && !snap.by_id["moved"].live);
+
+        // Held, but quiet past IDLE_LIMIT: inactive, like any other session.
+        let past = at + IDLE_LIMIT + SEC;
+        assert!(!Scanner::new(vec![Root::new(cfg.join("projects"))], 0).scan(past).by_id["held"].live);
+        assert!(!Scanner::new(vec![Root::new(cfg.join("projects"))], 3600 * SEC).scan(past).roots.contains(&"held".to_string()), "and past `since`");
         let _ = fs::remove_dir_all(&dir);
     }
 }

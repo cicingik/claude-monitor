@@ -14,7 +14,7 @@ use image::{DynamicImage, RgbaImage};
 use ratatui::{
     crossterm::{
         cursor::Show,
-        event::DisableMouseCapture,
+        event::{DisableBracketedPaste, DisableMouseCapture},
         execute,
         terminal::{LeaveAlternateScreen, disable_raw_mode},
     },
@@ -134,5 +134,5 @@ impl Write for Counted {
 
 pub(crate) fn restore(out: &mut impl Write) {
     let _ = disable_raw_mode();
-    let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen, Show);
+    let _ = execute!(out, DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen, Show);
 }

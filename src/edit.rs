@@ -23,6 +23,14 @@ impl LineEdit {
     pub fn clear(&mut self) {
         self.set("");
     }
+    /// Inserts text at the cursor, which ends up after it; a line break
+    /// (\r\n, \r or \n) goes in as one \n.
+    pub fn insert(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let n = text.chars().count();
+        self.chars.splice(self.at..self.at, text.chars());
+        self.at += n;
+    }
 
     /// Applies an editing key; false for a key that does not edit.
     pub fn key(&mut self, k: KeyEvent) -> bool {
@@ -86,10 +94,11 @@ impl LineEdit {
         i
     }
 
-    /// The text cut into rows of w chars, and the row and column of the cursor.
+    /// The text cut into rows of w chars, a line break shown as ↵, and the
+    /// row and column of the cursor.
     pub fn rows(&self, w: usize) -> (Vec<String>, usize, usize) {
         let w = w.max(1);
-        let mut rows: Vec<String> = self.chars.chunks(w).map(|c| c.iter().collect()).collect();
+        let mut rows: Vec<String> = self.chars.chunks(w).map(|c| c.iter().map(|&c| if c == '\n' { '↵' } else { c }).collect()).collect();
         let (row, col) = (self.at / w, self.at % w);
         if rows.len() <= row {
             rows.push(String::new()); // the cursor after a full last row starts the next

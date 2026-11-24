@@ -89,7 +89,7 @@ use ratatui::{
     buffer::Buffer,
     crossterm::{
         cursor::Show,
-        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEventKind},
+        event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEventKind},
         execute,
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode},
     },
@@ -283,6 +283,11 @@ fn show(out: &mut Counted, office: &RgbaImage, cast: &mut Cast, d: &Display, app
         loop {
             let action = match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => Some(app.key(k)),
+                // A paste comes whole: its newlines are text, never enter.
+                Event::Paste(text) => {
+                    app.paste(&text);
+                    Some(Action::None)
+                }
                 // With clicks reported, the wheel no longer arrives as arrow keys.
                 Event::Mouse(m) if m.kind == MouseEventKind::ScrollUp => Some(app.wheel(true)),
                 Event::Mouse(m) if m.kind == MouseEventKind::ScrollDown => Some(app.wheel(false)),
@@ -324,10 +329,10 @@ fn show(out: &mut Counted, office: &RgbaImage, cast: &mut Cast, d: &Display, app
                         // Claude Code takes the terminal as office got it, and gives it back.
                         let back = term.backend_mut();
                         disable_raw_mode()?;
-                        execute!(back, DisableMouseCapture, LeaveAlternateScreen, Show)?;
-                        let r = bridge::resume_here(&app.claude, &h.config_dir, &h.cwd, &h.session);
+                        execute!(back, DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen, Show)?;
+                        let r = bridge::run_here(&app.claude, &h.config_dir, &h.cwd, &h.launch);
                         enable_raw_mode()?;
-                        execute!(back, EnterAlternateScreen, SetTitle("office"), EnableMouseCapture)?;
+                        execute!(back, EnterAlternateScreen, SetTitle("office"), EnableMouseCapture, EnableBracketedPaste)?;
                         app.ran_here(&h, r);
                         full = true;
                     }
@@ -555,7 +560,7 @@ fn run(args: Args) -> Result<String, Box<dyn Error>> {
     }));
     // Clicks are reported only once detection has had its answers, so none is taken for one.
     let shown = Display::detect(&args).and_then(|d| {
-        execute!(out, EnableMouseCapture)?;
+        execute!(out, EnableMouseCapture, EnableBracketedPaste)?;
         Ok((show(&mut out, &office, &mut cast, &d, &mut app, &scans, &rescan)?, d))
     });
     restore(&mut out);
