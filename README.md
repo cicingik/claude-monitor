@@ -293,7 +293,7 @@ art.
 | `i`                              | open or close the card of the selected agent |
 | `↑`/`↓`, `k`/`j`, `tab`, wheel   | select the previous or next agent |
 | `enter`                          | open the selected agent in the tree view |
-| `p`                              | open the tree on the selected agent, typing in its session's [prompt panel](#prompt-panel) |
+| `p`                              | open the tree on the selected agent, with its session in [Claude Code's terminal](#session-panel) |
 | `v`                              | switch between the office and the tree view |
 | `r`                              | rescan |
 | `q`, `esc`, `ctrl+c`             | quit (`esc` closes an open card first) |
@@ -394,79 +394,46 @@ your settings allow without asking.
 | `enter`, `space`  | collapse or expand a node  |
 | `tab`             | next tab                   |
 | `1` `2` `3`       | Activity, Interactions, Usage |
-| `p`               | type in the prompt panel   |
-| `o`               | resume the selected session in the background, then type in its panel |
+| `p`               | open the session in [Claude Code's terminal](#session-panel), resuming it in the background first if it is not running |
+| `pgup` `pgdn`     | scroll the session's conversation |
 | `n`               | start a [new session](#new-session) in a folder you pick |
-| mouse drag        | select text inside one pane (tree, prompt or details) and copy it to the clipboard on release, through the terminal (OSC 52; in tmux, `set -g set-clipboard on`) |
+| mouse drag        | select text inside one pane (tree, session or details) and copy it to the clipboard on release, through the terminal (OSC 52; in tmux, `set -g set-clipboard on`) |
 | `v`               | switch to the office view  |
 | `r`               | drop all state and rescan  |
 | `q`, `ctrl+c`     | quit                       |
 
-## Prompt panel
+## Session panel
 
 Under the tree sits a panel for the session of the selected row (a subagent's
-row means its session). From it you can answer the session's permission
-request or send it a prompt, in any terminal: office talks to Claude Code
-through Claude Code's own hooks, never by typing into another window.
+row means its session). It shows the session's conversation as Claude Code
+does, newest at the bottom: your prompts after `>`, its replies after `●`,
+whole and wrapped, its tool calls on one line each. A question or a plan it
+waits on shows under them. `pgup` and `pgdn` scroll it.
 
-Install the hooks once, into the `settings.json` of `~/.claude` and every
-`~/.claude-*` (a copy of the old file is kept as `settings.json.bak-office`),
-then restart the sessions you want to reach:
+`p` opens the session in Claude Code's own terminal, inside the panel,
+which then takes the full width. office runs `claude attach <id>` of the
+session's background session in a pseudo-terminal. A session that is not
+running is resumed first with `claude --resume <id> --bg`, in its folder and
+under its config dir, and the terminal opens once it runs. Everything Claude
+Code does works there: prompts, slash commands, permission dialogs,
+questions.
 
-```sh
-office hook install      # office hook uninstall removes them again
-```
+Every key goes to Claude Code but `esc`, which detaches: the terminal closes
+and the tree has the keys again. So Claude Code never sees `esc` here: use
+`ctrl+c` to interrupt it, and pick an option to leave a dialog. The session
+keeps running in the background, also after office quits.
+`claude attach <id>` shows it in any terminal, and `claude stop <id>` ends it.
 
-Run it with the `office` you keep, such as `~/.local/bin/office`: the hooks
-run that very file, so a build directory that gets cleaned breaks them. Run it
-again after updating office; when the installed hooks are older than this
-office, the panel says they are out of date. A running session keeps the hooks
-it started with, so restart it (or `o` to resume it) to pick up new ones.
-
-Press `p` on an agent in the office, or in the tree. While the panel has the
-keys (orange border), every key is text; `esc` gives them back to the tree.
-
-The panel reads like Claude Code's own: the session's conversation fills it,
-newest at the bottom (your prompts after `>`, its replies after `●`, whole and
-wrapped, its tool calls on one line each, prompts sent from office included;
-prompts the session has not taken yet show last, dim, marked not taken yet),
-and you type in a rounded box under it. What the session waits on sits just
-over the box: a permission request (`asks: Bash: rm -rf build`, then the
-whole call: the full command, an edit's file with its removed and added lines,
-and what `2` saves, such as `2 saves: Bash(npm test:*) (this project)`), a question
-with its numbered options (asked one at a time when there are several), or a
-plan waiting for approval.
-
-| Key              | Action |
-|------------------|--------|
-| text, `enter`    | send the prompt to the session |
-| `/`              | list the session's slash commands as you type; `↑`/`↓` pick, `tab` completes, `enter` runs the picked one |
-| `←` `→`, `home` `end` | move the cursor; `ctrl`/`alt`+`←` `→` by word |
-| `backspace` `delete`, `ctrl+w` `ctrl+u` `ctrl+k` | delete a char, the word before, or to the start or end |
-| `1` `2` `3`      | with an empty prompt: answer the waiting permission request yes · yes, don't ask again · no |
-| `1`…`9`          | with an empty prompt: pick that option of the session's question; or type your own answer and `enter` |
-| `pgup` `pgdn`, mouse wheel | scroll the conversation; sending a prompt goes back to the newest |
-| `↑`/`↓`          | with no command list: walk this project's earlier prompts, newest first (Claude Code's own history and those sent from office); `↓` past the newest brings back what you were typing, and any edit ends the walk |
-| `ctrl+x`         | take back the last prompt sent that the session has not taken yet; it goes back into the box to edit |
-| `esc`            | back to the tree |
-| `ctrl+c`         | quit |
-
-The panel says whether a Claude Code process holds the session (`running`).
-When none does, `o` in the tree resumes it with `claude --resume <id> --bg`,
-in the session's folder and under its config dir: Claude Code's own
-background session, which needs no terminal. Its waiter starts with it, so
-prompts from the panel reach it; `claude attach <id>` shows it in a terminal,
-`claude stop <id>` ends it. A session already running is not started twice.
-Sending a prompt to a session that is not running resumes it the same way, so
-the prompt reaches it with no terminal open.
+Only background sessions can be attached. For a session open in a terminal of
+its own, the panel says so. Exit it there and press `p` to reopen it here.
 
 A background session cannot ask whether to trust its folder, so Claude Code
 refuses one in a folder that account has not trusted yet (and always in your
 home directory). The panel then says so, with the command that trusts it, and
-`o` again runs `claude --resume <id>` right in office's terminal: answer
-Claude Code's trust prompt there and use the session; office comes back when
-you exit Claude. Once trusted, `o` resumes it in the background. office
-never marks a folder trusted itself.
+`p` again runs `claude --resume <id>` right in office's terminal:
+answer Claude Code's trust prompt there and use the session; office comes back
+when you exit Claude. Once trusted, it opens in the panel. office never marks
+a folder trusted itself.
 
 ## New session
 
@@ -476,51 +443,36 @@ a path starting with `/` or `~` (`tab` completes it). `ctrl+t` switches the
 account, starting with the selected session's. `enter` takes the folder, then
 type the first prompt: `enter` starts `claude --bg -- <prompt>` there, so the
 prompt reaches the session as your own message. A session writes nothing
-before its first prompt, so it needs one to show in the tree. It is selected,
-with its panel taking the keys, once a scan shows it. `esc` goes back a step.
+before its first prompt, so it needs one to show in the tree. Once a scan
+shows it, it is selected and opens in Claude Code's terminal. `esc` goes back
+a step.
 
 A folder the account has not trusted yet (or your home directory) cannot
-start in the background: the note says so, and `o` starts it right in
+start in the background: the note says so, and `p` starts it right in
 office's terminal instead, where you answer Claude Code's trust prompt.
 
-How it works (files in `$XDG_STATE_HOME/claude-monitor/bridge`, else
-`~/.local/state/claude-monitor/bridge`):
+## Waiting status
 
-- **Permission requests:** a `PermissionRequest` hook (`office hook permission`)
-  files each request while office runs and waits up to 10 minutes for its
-  answer. Claude Code shows its own dialog all along: answer either place.
-  When office is not running, the hook returns at once and changes nothing.
-  "Yes, don't ask again" adds the rule Claude Code itself suggests.
-- **Headless runs** (`claude -p`, the Agent SDK) are left alone by both hooks:
-  they end on their own, and would wait on a waiter.
-- **Prompts:** `Stop` and `SessionStart` hooks (`office hook wait`) start a
-  background waiter that never blocks the session (`asyncRewake`). A prompt
-  you send wakes an idle session at once. Sent to a busy one, Claude Code hands
-  it over during or after that turn. Prompts sent before the session takes one
-  queue up and arrive in the order sent, one per turn. The waiter waits up to
-  24 hours: its hook sets that as its `timeout`, because Claude Code kills a
-  hook after its timeout, background ones too, and the default is 10 minutes.
-  A session with no waiter (not started or ended a turn since the hooks were
-  installed) takes a prompt at the end of its next turn; the panel says
-  "queued" and why. The session reads it as a hook message that says it came
-  from claude-monitor, not as text typed into its prompt box.
-- **Taking a prompt back:** each prompt not taken yet is a file,
-  `prompt-<time>.txt`, in the session's folder there; `ctrl+x` deletes the
-  newest, so the session never reads it. Once the hook has taken it, there is
-  nothing left to take back.
-- **Sessions that moved on:** `/resume` or `/clear` in a terminal moves its
-  conversation to another session id. The old id no longer counts as running,
-  so the panel does not offer it as one; the conversation goes on under the
-  new id.
-- **Prompt history:** prompts sent from office are appended to `history.jsonl`
-  there. `↑`/`↓` merge it by time with the account's own `history.jsonl`,
-  which only Claude Code writes.
-- **Slash commands:** that hook message never reaches Claude Code's command
-  parser, so office sends a command as its file instead: a skill's `SKILL.md`
-  or a custom command's `.md`, from the project's `.claude`, the account, or an
-  enabled plugin, for the session to read and follow with your arguments.
-  Built-ins such as `/clear`, `/compact` and `/model` have no file and run only
-  in the session's own terminal; the panel says so and keeps them typed.
+The transcript records no line when a permission prompt opens, so the tree
+guesses `?` (waiting) from it. A hook makes it exact. Install it once, into
+the `settings.json` of `~/.claude` and every `~/.claude-*` (a copy of the old
+file is kept as `settings.json.bak-office`):
+
+```sh
+office hook install      # office hook uninstall removes it again
+```
+
+Run it with the `office` you keep, such as `~/.local/bin/office`: the hook
+runs that very file, so a build directory that gets cleaned breaks it.
+Installing again also removes the prompt waiter (`office hook wait`) that
+older versions installed; until then, that waiter does nothing.
+
+The `PermissionRequest` hook (`office hook permission`) files each request
+while office runs, in `$XDG_STATE_HOME/claude-monitor/bridge` (else
+`~/.local/state/claude-monitor/bridge`), and removes it once Claude Code's own
+dialog is answered, or after 10 minutes. It never answers a request. When
+office is not running, it returns at once. Headless runs (`claude -p`, the
+Agent SDK) are left alone.
 
 ## Data sources
 
@@ -531,10 +483,8 @@ Transcripts are under `--root` (default `~/.claude/projects` and every
 | File | For |
 |------|-----|
 | `.credentials.json` | the [Accounts](#accounts) limits |
-| `sessions/<pid>.json` | which sessions a running Claude Code process holds |
-| `settings.json` | whether the hooks are installed, and the enabled plugins; `office hook install` and `uninstall` write it |
-| `plugins/installed_plugins.json`, `skills/`, `commands/`, and the project's `.claude/` | the slash commands of the [prompt panel](#prompt-panel) |
-| `history.jsonl` | the prompts `↑`/`↓` recall in the prompt panel |
+| `sessions/<pid>.json` | which sessions a running Claude Code process holds, and whether in the background (`claude attach` takes its job id) |
+| `settings.json` | `office hook install` and `uninstall` write it |
 
 - `<project>/<sessionId>.jsonl`: the main session, one JSON object per line.
   The project directory is the session cwd with `/` replaced by `-`; the UI
@@ -564,7 +514,7 @@ How the numbers and links are derived:
   from that agent to the transcript owner.
 
 The tree and `--dump` show short summaries: tool names with a short argument,
-and at most 60 characters of any prompt or reply. The prompt panel shows the
+and at most 60 characters of any prompt or reply. The session panel shows the
 session's prompts and replies whole (up to 4000 characters each, the last 50
 events), as Claude Code's own window does. Transcripts can hold secrets, so
 mind who sees your screen while the panel is open.
@@ -601,11 +551,10 @@ where the graph expects it. `python3 tools/forest_map.py [OUT.png]` repaints it
 | `src/cast.rs` | custom characters from the sprites directory |
 | `src/actors.rs` | who sits where; `actors/graph.rs` the corridors, `actors/walk.rs` movement, `actors/paint.rs` drawing |
 | `src/scan.rs` | the scan of every projects directory; `scan/transcript.rs` one transcript, `scan/text.rs` text and time helpers |
-| `src/ui.rs` | app state and keys; `ui/draw.rs` the tree view, `ui/panel.rs` the prompt panel, `ui/card.rs` the office card, `ui/select.rs` mouse selection |
-| `src/bridge.rs` | the hooks' side and office's side of talking to sessions |
-| `src/commands.rs` | a session's slash commands, and the message a prompt is sent as |
-| `src/history.rs` | the prompts `↑`/`↓` recall |
-| `src/edit.rs` | the prompt line being typed |
+| `src/ui.rs` | app state and keys; `ui/draw.rs` the tree view, `ui/panel.rs` the session panel, `ui/card.rs` the office card, `ui/select.rs` mouse selection |
+| `src/bridge.rs` | the permission hook, who holds a session, and starting `claude` |
+| `src/embed.rs` | Claude Code's terminal in the panel: `claude attach` in a pseudo-terminal |
+| `src/edit.rs` | the new-session picker's line being typed |
 | `src/markdown.rs` | replies rendered as in Claude Code |
 | `src/limits.rs` | the accounts' plan limits |
 | `src/format.rs` | times, durations and labels as printed |

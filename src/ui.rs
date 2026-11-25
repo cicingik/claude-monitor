@@ -19,10 +19,8 @@ use ratatui::{
 
 use crate::{
     actors::{self, Scene, Walker},
-    bridge::{self, Ask, Launch},
+    bridge::{self, Launch},
     cast::Cast,
-    commands::Command,
-    edit::LineEdit,
     limits::Limits,
     scan::{Agent, Kind, Snapshot, Status},
 };
@@ -83,40 +81,23 @@ pub struct App {
     // What the card calls each agent instead of its id: the file name of
     // the character it is drawn with, without the extension.
     names: HashMap<String, String>,
-    // The prompt panel under the tree, for the session of the selected row.
+    // The session panel under the tree, for the session of the selected row.
     pub bridge: PathBuf, // bridge::dir(), a temporary one in tests
     pub claude: PathBuf, // the claude program sessions are resumed with; in tests, none, or a fake
-    pub hooks: bool,     // office's hooks are in a Claude Code settings.json
-    typing: bool,        // keys go to the panel, not the tree
-    input: LineEdit,
-    commands: Vec<Command>,                  // the panel session's slash commands
-    commands_for: Option<(PathBuf, String)>, // its config dir and cwd: commands is theirs
-    menu_at: usize,
     log_scroll: usize,     // how many lines the conversation is scrolled up from its newest
     log_max: Cell<usize>,  // how far it can be, as last drawn
     log_for: String,       // the session the scroll is for: another starts at the newest                           // the command picked in the menu of those matching the input
     note: String,     // what the last prompt or answer did
-    ask: Option<Ask>, // the session's permission request waiting for an answer
-    queued: Vec<String>, // as typed, oldest first: the prompts left for the session, not taken yet
-    picks: Vec<String>, // answers given so far to the questions of the ask with id picks_for
-    picks_for: String,
     live: bool, // a running Claude Code process holds the session
     resuming: Option<Resuming>,
-    recall: Option<Recall>, // a walk through the history with ↑/↓, if one is on
     selection: Option<select::Selection>, // text dragged over in the tree view
     panes: Cell<[Rect; 3]>, // the insides of the tree, prompt and detail panes, as last drawn
     pub copied: Option<String>, // selected text for main to put on the clipboard
     here_for: Option<Here>, // the session whose background resume needs a terminal: o runs it here
     picker: Option<new::Picker>, // the new-session picker over the tree, while open
     select_started: Option<String>, // a session office started: selected once a scan shows it
-}
-
-/// A walk through the session's project's prompts: the prompt at shows,
-/// draft is what was being typed when it began.
-struct Recall {
-    list: Vec<String>,
-    at: usize,
-    draft: String,
+    term: Option<crate::embed::Embed>, // Claude Code's own terminal in the panel: it has every key while open
+    term_for: Option<(String, std::time::Instant)>, // a session resuming to open there, and since when
 }
 
 /// A `claude --bg` until it returns, and what explains its result.
@@ -127,7 +108,7 @@ struct Resuming {
     config_dir: PathBuf,
 }
 
-/// The fewest rows of the prompt panel, borders included; it takes two thirds
+/// The fewest rows of the session panel, borders included; it takes two thirds
 /// of the left column when there is room.
 const PANEL_H: u16 = 9;
 
@@ -191,23 +172,14 @@ impl App {
             names: HashMap::new(),
             bridge: bridge::dir(),
             claude: (if cfg!(test) { "office-test-no-claude" } else { "claude" }).into(),
-            hooks: false,
-            typing: false,
-            input: LineEdit::default(),
-            commands: Vec::new(),
-            commands_for: None,
-            menu_at: 0,
             log_scroll: 0,
             log_max: Cell::new(0),
             log_for: String::new(),
             note: String::new(),
-            ask: None,
-            queued: Vec::new(),
-            picks: Vec::new(),
-            picks_for: String::new(),
             live: false,
+            term: None,
+            term_for: None,
             resuming: None,
-            recall: None,
             selection: None,
             panes: Cell::new([Rect::default(); 3]),
             copied: None,
@@ -220,8 +192,8 @@ impl App {
     /// The mouse wheel: it scrolls the conversation while the panel has the
     /// keys, else it moves the tree's cursor or the office's focus as ↑/↓ do.
     pub fn wheel(&mut self, up: bool) -> Action {
-        if self.typing && self.view == View::Tree {
-            self.scroll_log(if up { 3 } else { -3 });
+        if let Some(t) = self.term.as_mut().filter(|_| self.view == View::Tree) {
+            t.wheel(up);
             return Action::None;
         }
         self.key(KeyEvent::from(if up { KeyCode::Up } else { KeyCode::Down }))
@@ -231,7 +203,8 @@ impl App {
         let started = self.select_started.as_ref().and_then(|short| snap.roots.iter().find(|id| id.starts_with(short.as_str())).cloned());
         self.snap = Some(snap);
         if let Some(id) = started {
-            (self.selected, self.select_started, self.typing) = (id, None, true);
+            // Claude Code's terminal opens on it once it is registered.
+            (self.selected, self.select_started, self.term_for) = (id.clone(), None, Some((id, std::time::Instant::now())));
         }
         self.sync_cursor();
     }
@@ -276,23 +249,29 @@ impl App {
         if self.view != View::Tree {
             return;
         }
-        if let Some(p) = self.picker.as_mut() {
+        if let Some(t) = self.term.as_mut() {
+            t.paste(text);
+        } else if let Some(p) = self.picker.as_mut() {
             p.paste(&text.replace(['\r', '\n'], ""));
-        } else if self.typing {
-            self.input.insert(text);
-            (self.menu_at, self.recall) = (0, None);
         }
     }
 
     /// Handles a key press.
     pub fn key(&mut self, k: KeyEvent) -> Action {
         self.selection = None;
+        // Claude Code's terminal takes every key, ctrl+c too, but esc, which detaches.
+        if let Some(t) = self.term.as_mut().filter(|_| self.view == View::Tree) {
+            if k.code == KeyCode::Esc {
+                self.term = None; // ends the attach, never the session
+                self.note = "detached: the session runs on in the background".into();
+            } else {
+                t.key(k);
+            }
+            return Action::None;
+        }
         let ctrl_c = k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
         if self.picker.is_some() && self.view == View::Tree && !ctrl_c {
             return self.picker_key(k);
-        }
-        if self.typing && self.view == View::Tree && !ctrl_c {
-            return self.panel_key(k);
         }
         if k.code == KeyCode::Esc && self.card {
             self.card = false;
@@ -325,11 +304,13 @@ impl App {
     fn office_key(&mut self, code: KeyCode) -> Action {
         match code {
             KeyCode::Char('i') => self.card = !self.card,
-            // The tree, on the selected agent, typing in its session's panel.
+            // The tree, on the selected agent, with its session's Claude Code terminal open.
             KeyCode::Char('p') => {
-                let action = self.office_key(KeyCode::Enter);
-                self.typing = true;
-                return action;
+                let switched = self.office_key(KeyCode::Enter);
+                return match self.open_term() {
+                    Action::None => switched,
+                    run => run,
+                };
             }
             KeyCode::Char('v') => {
                 (self.view, self.card) = (View::Tree, false);
@@ -369,8 +350,9 @@ impl App {
                 }
             }
             KeyCode::Tab => self.tab = (self.tab + 1) % TABS.len(),
-            KeyCode::Char('p') => self.typing = true,
-            KeyCode::Char('o') => return self.resume(),
+            KeyCode::Char('p') => return self.open_term(),
+            KeyCode::PageUp => self.scroll_log(self.page() as isize),
+            KeyCode::PageDown => self.scroll_log(-(self.page() as isize)),
             KeyCode::Char('n') => self.open_picker(),
             KeyCode::Char(c @ '1'..='3') => self.tab = c as usize - '1' as usize,
             KeyCode::Char('v') => {
@@ -682,19 +664,16 @@ mod tests {
         let s1 = snap.by_id.get_mut("s1").unwrap();
         s1.last_text = format!("{}\nShould I also delete the old build directory before rebuilding?", "line\n".repeat(30));
         let mut app = App::new(0, 1);
-        app.hooks = true;
         app.set_snapshot(snap.clone());
-        app.selected = "a1".into();
+        (app.selected, app.view) = ("a1".into(), View::Tree);
         let text = |app: &App| app.panel_lines(40, 12).iter().map(Line::to_string).collect::<Vec<_>>();
         let t = text(&app);
         assert_eq!(t.len(), 12, "{t:#?}");
         assert!(t[1].starts_with("↑ ") && t[1].ends_with("more · pgup"), "older lines are above: {t:#?}");
-        let end = t.iter().position(|l| l.starts_with("  Should I")).expect("the reply's end shows, over the box");
-        assert_eq!((t[end].as_str(), t[end + 1].as_str()), ("  Should I also delete the old build", "  directory before rebuilding?"));
-        assert!(t[end + 2].starts_with('╭'), "{t:#?}");
+        let end = t.iter().position(|l| l.starts_with("  Should I")).expect("the reply's end shows, at the bottom");
+        assert_eq!(t[end..], ["  Should I also delete the old build", "  directory before rebuilding?"], "{t:#?}");
 
-        // Page up shows older lines, page down the newest again.
-        (app.view, app.typing) = (View::Tree, true);
+        // Page up in the tree shows older lines, page down the newest again.
         app.key(KeyEvent::from(KeyCode::PageUp));
         let t = text(&app);
         assert!(!t.iter().any(|l| l.starts_with("  Should I")) && t.iter().any(|l| l.starts_with("↓ ") && l.ends_with("newer · pgdn")), "{t:#?}");
@@ -704,9 +683,8 @@ mod tests {
         snap.by_id.get_mut("s1").unwrap().asking = "Which approach?\n  1. Fast — skip the cache\n  2. Safe".into();
         app.set_snapshot(snap);
         let t = text(&app);
-        let at = t.iter().position(|l| l == "asks you:").expect("the question shows");
-        assert_eq!(t[at + 1..at + 4], ["Which approach?", "  1. Fast — skip the cache", "  2. Safe"], "{t:#?}");
-        assert!(t[at + 4].starts_with('╭'), "over the input box: {t:#?}");
+        let at = t.iter().position(|l| l == "asks you · p to answer:").expect("the question shows");
+        assert_eq!(t[at + 1..], ["Which approach?", "  1. Fast — skip the cache", "  2. Safe"], "{t:#?}");
     }
 
     /// The conversation reads as in Claude Code: prompts after `>`, replies
@@ -720,7 +698,6 @@ mod tests {
             crate::scan::Event { kind: "text", summary: "Fixed: a missing import".into(), text: "Fixed: a missing import in main.rs, and the tests pass again.".into(), ..Default::default() },
         ];
         let mut app = App::new(0, 1);
-        app.hooks = true;
         app.set_snapshot(snap);
         app.selected = "s1".into();
         let t = app.panel_lines(40, 14).iter().map(Line::to_string).collect::<Vec<_>>();
@@ -728,15 +705,14 @@ mod tests {
         assert_eq!(t[at + 1..at + 5], ["● Bash: cargo build", "", "● Fixed: a missing import in main.rs,", "  and the tests pass again."], "{t:#?}");
     }
 
-    /// A background resume refused for trust offers to run it here: the keys
-    /// go back to the tree, and o hands the terminal to that session.
+    /// A background resume refused for trust offers to run it here: o (or p)
+    /// hands office's terminal to that session.
     #[test]
     fn an_untrusted_resume_offers_to_run_it_here() {
         let mut app = App::new(0, 1);
         app.view = View::Tree;
         app.set_snapshot(busy_snap());
         app.selected = "s1".into();
-        app.typing = true;
         let child = std::process::Command::new("sh")
             .args(["-c", "echo 'Workspace not trusted. Run `claude` in /tmp once and accept the trust prompt, then retry.' >&2; exit 1"])
             .stdout(std::process::Stdio::piped())
@@ -748,48 +724,45 @@ mod tests {
             app.poll_resume();
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(app.note.contains("/tmp is not trusted") && app.note.contains("Press o to run it here"), "{}", app.note);
-        assert!(!app.typing, "o is a key of the tree again");
+        assert!(app.note.contains("/tmp is not trusted") && app.note.contains("Press p to run it here"), "{}", app.note);
         let want = Here { launch: Launch::Resume("s1".into()), cwd: "/tmp".into(), config_dir: "/cfg".into() };
-        assert_eq!(press(&mut app, KeyCode::Char('o')), Action::RunHere(want.clone()));
+        assert_eq!(press(&mut app, KeyCode::Char('p')), Action::RunHere(want.clone()));
         app.ran_here(&want, Ok(std::process::Command::new("true").status().unwrap()));
         assert!(app.note.starts_with("back from s1"), "{}", app.note);
         assert!(app.here_for.is_none(), "offered once");
     }
 
-    /// A prompt sent to a session no process holds resumes it in the
-    /// background, whose waiter then takes the prompt: no terminal needed.
+    /// p on a session no process holds resumes it in the background, and
+    /// its terminal opens once Claude Code registers it.
     #[test]
-    fn a_prompt_to_a_session_not_running_resumes_it() {
+    fn p_on_a_session_not_running_resumes_it_to_open_there() {
         let root = std::env::temp_dir().join(format!("office-autoresume-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let (fake, said) = (root.join("claude"), root.join("args"));
-        std::fs::write(&fake, format!("#!/bin/sh\necho \"$@\" > {}\necho 'Started in the background'\n", said.display())).unwrap();
+        std::fs::write(&fake, format!("#!/bin/sh\necho \"$@\" > {}\n", said.display())).unwrap();
         std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let mut app = App::new(0, 1);
-        (app.bridge, app.hooks, app.claude) = (root.join("bridge"), true, fake);
-        app.set_snapshot(busy_snap());
+        app.claude = fake;
+        let mut snap = busy_snap();
+        snap.by_id.get_mut("s1").unwrap().config_dir = root.join("cfg");
+        app.set_snapshot(snap);
         app.focus = "s1".into();
         press(&mut app, KeyCode::Char('p'));
-        for c in "check connection".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        press(&mut app, KeyCode::Enter);
-        assert!(app.note.starts_with("queued") && app.note.contains("resuming it in the background"), "{}", app.note);
+        assert_eq!(app.note, "resuming it in the background…");
         while app.resuming.is_some() {
             app.poll_resume();
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert_eq!(std::fs::read_to_string(&said).unwrap().trim(), "--bg --resume s1");
-        assert_eq!(app.note, "resumed in the background: it takes the waiting prompt now");
-        assert_eq!(bridge::queued(&root.join("bridge"), "s1").len(), 1, "the prompt waits for the resumed session's waiter");
+        app.poll_bridge();
+        assert!(app.term_for.as_ref().is_some_and(|(id, _)| id == "s1") && app.term.is_none(), "it opens once registered");
         let _ = std::fs::remove_dir_all(&root);
     }
 
     /// n opens the picker over the tree: enter takes the folder a session
     /// ran in, the first prompt starts `claude --bg -- <prompt>` there, and
-    /// the new session is selected, its panel typing, once a scan shows it.
+    /// the new session is selected once a scan shows it, its terminal to open.
     #[test]
     fn n_starts_a_new_session_in_a_picked_folder() {
         let root = std::env::temp_dir().join(format!("office-new-{}", std::process::id()));
@@ -800,7 +773,7 @@ mod tests {
         std::fs::write(&fake, format!("#!/bin/sh\necho \"$@\" > {}\necho 'backgrounded · abcd1234 (idle — send a prompt to start)'\n", said.display())).unwrap();
         std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let mut app = App::new(0, 1);
-        (app.bridge, app.hooks, app.claude, app.view) = (root.join("bridge"), true, fake, View::Tree);
+        (app.claude, app.view) = (fake, View::Tree);
         let mut snap = busy_snap();
         let s1 = snap.by_id.get_mut("s1").unwrap();
         (s1.cwd, s1.config_dir) = (proj.to_string_lossy().into_owned(), root.join("cfg"));
@@ -827,7 +800,8 @@ mod tests {
         snap.roots.insert(0, new.id.clone());
         snap.by_id.insert(new.id.clone(), new);
         app.set_snapshot(snap);
-        assert_eq!((app.selected.as_str(), app.typing), ("abcd1234-0000@work", true));
+        assert_eq!(app.selected, "abcd1234-0000@work");
+        assert!(app.term_for.as_ref().is_some_and(|(id, _)| id == "abcd1234-0000@work"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -851,20 +825,19 @@ mod tests {
         }
         assert!(app.note.starts_with("not started: /tmp is not trusted"), "{}", app.note);
         let want = Here { launch, cwd: "/tmp".into(), config_dir: "/cfg".into() };
-        assert_eq!(press(&mut app, KeyCode::Char('o')), Action::RunHere(want));
+        assert_eq!(press(&mut app, KeyCode::Char('p')), Action::RunHere(want));
     }
 
     /// A long note wraps over several rows instead of being cut to one.
     #[test]
     fn panel_note_wraps_whole() {
         let mut app = App::new(0, 1);
-        app.hooks = true;
         app.set_snapshot(busy_snap());
         app.selected = "s1".into();
-        app.note = "not resumed: ~/dev/api is not trusted for this account yet. Run this once in a terminal and accept the trust prompt, then press o again: cd ~/dev/api && claude".into();
-        let t = app.panel_lines(40, 20).iter().map(Line::to_string).collect::<Vec<_>>().join(" ");
-        let note = t.split('╯').nth(1).expect("the note under the input box");
-        assert!(note.contains("cd ~/dev/api && claude") && !note.contains('…'), "{t}");
+        app.note = "not resumed: ~/dev/api is not trusted for this account yet. Run this once in a terminal and accept the trust prompt, then press p again: cd ~/dev/api && claude".into();
+        let t = app.panel_lines(40, 20).iter().map(Line::to_string).collect::<Vec<_>>();
+        let at = t.iter().position(|l| l.starts_with("not resumed:")).expect("the note");
+        assert!(t[at..].join(" ").ends_with("cd ~/dev/api && claude") && !t[at..].join(" ").contains('…'), "{t:#?}");
     }
 
     /// A session row is `[account](directory) title`; no row shows the
@@ -881,176 +854,6 @@ mod tests {
         assert!(!s.contains("opus") && !s.contains("session"), "{s}");
         assert!(rows.iter().all(|r| !r.contains("opus") && !r.contains("tok")), "{rows:#?}");
         assert!(rows.iter().any(|r| r.contains("Explore")), "subagents keep their type: {rows:#?}");
-    }
-
-    /// A waiting AskUserQuestion shows its question and numbered options; a
-    /// digit picks an option, typed text answers in one's own words, and
-    /// the last answer goes to the hook as question → answer.
-    #[test]
-    fn panel_answers_a_question_by_picking() {
-        let root = std::env::temp_dir().join(format!("office-pick-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("s1")).unwrap();
-        let me = std::process::id(); // a live hook's pid: a dead one's question is not asked
-        std::fs::write(root.join("s1").join(format!("ask-{me}.json")), r#"{"summary":"AskUserQuestion: Color?","questions":[
-            {"question":"Color?","options":[{"label":"Red","description":"warm"},{"label":"Blue"}]},
-            {"question":"Size?","options":[{"label":"S"},{"label":"L"}]}]}"#).unwrap();
-        let mut app = App::new(0, 1);
-        (app.bridge, app.hooks) = (root.clone(), true);
-        app.set_snapshot(busy_snap());
-        app.focus = "s1".into();
-        press(&mut app, KeyCode::Char('p'));
-        app.poll_bridge();
-        let text = app.panel_lines(50, 20).iter().map(Line::to_string).collect::<Vec<_>>();
-        let at = text.iter().position(|l| l == "asks you (1 of 2):").unwrap_or_else(|| panic!("{text:#?}"));
-        assert_eq!(text[at + 1..at + 4], ["Color?", "  1. Red — warm", "  2. Blue"]);
-        assert!(!text.iter().any(|l| l.contains("1 yes")), "no yes/no for a question: {text:#?}");
-        press(&mut app, KeyCode::Char('2'));
-        let text = app.panel_lines(50, 20).iter().map(Line::to_string).collect::<Vec<_>>();
-        assert!(text.contains(&"asks you (2 of 2):".to_string()) && text.contains(&"Size?".to_string()), "{text:#?}");
-        for c in "medium".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        press(&mut app, KeyCode::Enter);
-        let got: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("s1").join(format!("answer-{me}.json"))).unwrap()).unwrap();
-        assert_eq!(got, serde_json::json!({ "answers": { "Color?": "Blue", "Size?": "medium" } }));
-        assert!(bridge::queued(&root, "s1").is_empty(), "an answer, not a prompt");
-        assert_eq!(app.note, "answered: Blue · medium");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A slash shows the session's commands: ↓ picks, tab completes, enter
-    /// sends the picked one as its file to follow, a built-in stays typed,
-    /// and ←/→ move the cursor to edit inside the prompt.
-    #[test]
-    fn slash_opens_a_command_menu_and_the_cursor_edits_inside_the_prompt() {
-        let root = std::env::temp_dir().join(format!("office-menu-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let mut app = App::new(0, 1);
-        (app.bridge, app.hooks) = (root.clone(), true);
-        app.set_snapshot(busy_snap());
-        app.focus = "a1".into();
-        press(&mut app, KeyCode::Char('p'));
-        let s = app.panel_session().cloned().unwrap();
-        let cmd = |n: &str, file: Option<&str>| Command { name: n.into(), about: format!("{n} it"), file: file.map(PathBuf::from) };
-        app.commands = vec![cmd("compact", None), cmd("pstack:poteto-mode", Some("/p/poteto-mode/SKILL.md")), cmd("pstack:polish", Some("/p/polish/SKILL.md"))];
-        app.commands_for = Some((s.config_dir.clone(), s.cwd.clone()));
-        app.poll_bridge();
-        for c in "/po".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        let text = app.panel_lines(60, 30).iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("› /pstack:poteto-mode  pstack:poteto-mode it") && text.contains("  /pstack:polish"), "{text}");
-        press(&mut app, KeyCode::Down);
-        press(&mut app, KeyCode::Tab);
-        assert_eq!(app.input.text(), "/pstack:polish ");
-        for c in "the bug".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        for _ in 0..7 {
-            press(&mut app, KeyCode::Left);
-        }
-        for c in "fix ".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        assert_eq!(app.input.text(), "/pstack:polish fix the bug");
-        press(&mut app, KeyCode::Enter);
-        let sent = bridge::cancel(&root, "s1").unwrap().expect("sent");
-        assert!(sent.contains("Read /p/polish/SKILL.md in full") && sent.contains("arguments \"fix the bug\""), "{sent}");
-
-        for c in "/comp".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        press(&mut app, KeyCode::Enter);
-        assert!(bridge::queued(&root, "s1").is_empty() && app.note.contains("built into Claude Code"), "{}", app.note);
-        assert_eq!(app.input.text(), "/comp", "a built-in stays typed");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// ↑/↓ in the panel walk the project's prompts, Claude Code's own (pasted
-    /// text filled in) and those sent from office, newest first; past the
-    /// newest, what was being typed comes back.
-    #[test]
-    fn up_and_down_in_the_panel_recall_the_projects_prompts() {
-        let root = std::env::temp_dir().join(format!("office-recall-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let (config, bridge) = (root.join("config"), root.join("bridge"));
-        std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(config.join("history.jsonl"), concat!(
-            r#"{"display":"first","pastedContents":{},"timestamp":1,"project":"/proj"}"#, "\n",
-            r#"{"display":"elsewhere","pastedContents":{},"timestamp":2,"project":"/other"}"#, "\n",
-            r#"{"display":"look at [Pasted text #1 +1 lines]","pastedContents":{"1":{"id":1,"type":"text","content":"a\nb"}},"timestamp":3,"project":"/proj"}"#, "\n",
-        )).unwrap();
-        let mut app = App::new(0, 1);
-        (app.bridge, app.hooks) = (bridge.clone(), true);
-        let mut snap = busy_snap();
-        let s1 = snap.by_id.get_mut("s1").unwrap();
-        (s1.config_dir, s1.cwd) = (config.clone(), "/proj".into());
-        app.set_snapshot(snap);
-        app.focus = "s1".into();
-        press(&mut app, KeyCode::Char('p'));
-        for c in "sent here".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        press(&mut app, KeyCode::Enter);
-        for c in "draft".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        let mut seen = Vec::new();
-        for _ in 0..4 {
-            press(&mut app, KeyCode::Up);
-            seen.push(app.input.text());
-        }
-        assert_eq!(seen, ["sent here", "look at a\nb", "first", "first"]);
-        assert_eq!(app.selected, "s1", "the arrows recall, they do not move the tree");
-        press(&mut app, KeyCode::Down);
-        press(&mut app, KeyCode::Char('!'));
-        assert_eq!(app.input.text(), "look at a\nb!", "an edit ends the walk, keeping the text");
-        press(&mut app, KeyCode::Down);
-        assert_eq!(app.input.text(), "look at a\nb!", "no walk, no step");
-        app.input.set("draft");
-        press(&mut app, KeyCode::Up);
-        press(&mut app, KeyCode::Down);
-        assert_eq!(app.input.text(), "draft", "past the newest, the draft comes back");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A prompt sent while the session works shows in its conversation at
-    /// once, as typed and marked not taken yet, and goes once the hook takes it.
-    #[test]
-    fn a_sent_prompt_shows_in_the_conversation_until_taken() {
-        let root = std::env::temp_dir().join(format!("office-pending-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let mut app = App::new(0, 1);
-        (app.bridge, app.hooks) = (root.clone(), true);
-        app.set_snapshot(busy_snap());
-        app.focus = "s1".into();
-        press(&mut app, KeyCode::Char('p'));
-        for c in "fix the build".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        press(&mut app, KeyCode::Enter);
-        app.poll_bridge();
-        let s = screen(&mut app);
-        assert!(s.contains("> fix the build"), "{s}");
-        assert!(s.contains("not taken yet"), "{s}");
-
-        for c in "then test".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        press(&mut app, KeyCode::Enter);
-        app.poll_bridge();
-        let s = screen(&mut app);
-        let (first, second) = (s.find("> fix the build"), s.find("> then test"));
-        assert!(first.is_some() && second.is_some() && first < second, "both wait, in the order sent: {s}");
-
-        for _ in 0..2 {
-            bridge::cancel(&root, "s1").unwrap().expect("waiting"); // as the hook takes it
-        }
-        app.poll_bridge();
-        let s = screen(&mut app);
-        assert!(!s.contains("fix the build") && !s.contains("not taken yet"), "{s}");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A drag in the tree view selects text inside the pane it starts in,
@@ -1092,102 +895,55 @@ mod tests {
         assert!(!t.backend().buffer()[(x, y)].modifier.contains(Modifier::REVERSED));
     }
 
-    /// ctrl+x takes back a prompt the session has not taken yet, into the
-    /// box to edit; once taken, there is nothing to take back.
+    /// p on an agent in the office opens the tree on it, with its session's
+    /// background session in Claude Code's terminal: every key but esc goes
+    /// there; when the attach ends, or on esc, the tree has the keys again.
     #[test]
-    fn ctrl_x_takes_back_a_prompt_not_taken_yet() {
-        let root = std::env::temp_dir().join(format!("office-cancel-{}", std::process::id()));
+    fn p_opens_claude_codes_terminal_for_the_agents_session() {
+        let root = std::env::temp_dir().join(format!("office-term-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("cfg").join("sessions")).unwrap();
+        let me = std::process::id();
+        let held = serde_json::json!({ "pid": me, "sessionId": "s1", "kind": "bg", "jobId": "job1" });
+        std::fs::write(root.join("cfg").join("sessions").join("1.json"), held.to_string()).unwrap();
+        let fake = root.join("claude");
+        std::fs::write(&fake, "#!/bin/sh\necho \"attached to $2\"\nread line\necho \"got $line\"\n").unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let mut app = App::new(0, 1);
-        (app.bridge, app.hooks) = (root.clone(), true);
-        app.set_snapshot(busy_snap());
-        app.focus = "s1".into();
-        press(&mut app, KeyCode::Char('p'));
-        for c in "fix the build".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        press(&mut app, KeyCode::Enter);
-        let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
-        assert_eq!(app.key(ctrl_x), Action::None);
-        app.poll_bridge();
-        assert!(bridge::queued(&root, "s1").is_empty());
-        assert_eq!(app.input.text(), "fix the build");
-        assert!(app.note.starts_with("taken back"), "{}", app.note);
-        assert!(!screen(&mut app).contains("not taken yet"));
-
-        app.input.clear();
-        app.key(ctrl_x);
-        assert!(app.note.starts_with("nothing to take back"), "{}", app.note);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A paste with line breaks is one prompt, sent on enter only: its
-    /// breaks show as ↵ and reach the session as they were. Into the
-    /// picker it is a path, its breaks gone; with the tree's keys it does nothing.
-    #[test]
-    fn a_paste_is_one_prompt_however_many_lines() {
-        let root = std::env::temp_dir().join(format!("office-paste-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let mut app = App::new(0, 1);
-        (app.bridge, app.hooks, app.view) = (root.clone(), true, View::Tree);
-        app.set_snapshot(busy_snap());
-        app.selected = "s1".into();
-        app.paste("q");
-        assert!(app.input.is_empty(), "the tree's keys take no paste");
-        press(&mut app, KeyCode::Char('p'));
-        app.paste("got error, not started:\r\nback when you exit");
-        assert!(bridge::queued(&root, "s1").is_empty(), "nothing sent before enter");
-        let text = app.panel_lines(80, 20).iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("got error, not started:↵back when you exit"), "{text}");
-        press(&mut app, KeyCode::Enter);
-        let sent = bridge::queued(&root, "s1");
-        assert!(sent.len() == 1 && sent[0].ends_with("got error, not started:\nback when you exit"), "{sent:?}");
-        press(&mut app, KeyCode::Esc);
-        press(&mut app, KeyCode::Char('n'));
-        app.paste("/tmp\n");
-        assert_eq!(app.picker.as_ref().map(|p| p.input_text()), Some("/tmp".to_string()));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// p on an agent opens the tree on it with the panel taking keys: text
-    /// (q too) builds the prompt, enter leaves it for its session, a digit
-    /// on an empty prompt answers the session's permission request, esc
-    /// gives the keys back to the tree.
-    #[test]
-    fn p_opens_the_prompt_panel_for_the_agents_session() {
-        let root = std::env::temp_dir().join(format!("office-panel-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let mut app = App::new(0, 1);
-        (app.bridge, app.hooks) = (root.clone(), true);
-        app.set_snapshot(busy_snap());
+        app.claude = fake;
+        let mut snap = busy_snap();
+        snap.by_id.get_mut("s1").unwrap().config_dir = root.join("cfg");
+        app.set_snapshot(snap);
         app.focus = "a1".into();
         assert_eq!(press(&mut app, KeyCode::Char('p')), Action::Switched);
-        assert_eq!((app.view, app.typing, app.selected.as_str()), (View::Tree, true, "a1"));
-        assert_eq!(app.panel_session().map(|a| a.id.as_str()), Some("s1"), "a subagent's panel talks to its session");
-        for c in "quit now".chars() {
-            assert_eq!(press(&mut app, KeyCode::Char(c)), Action::None);
+        assert_eq!((app.view, app.selected.as_str()), (View::Tree, "a1"));
+        assert_eq!(app.term.as_ref().map(|t| t.session.as_str()), Some("s1"), "a subagent's terminal is its session's");
+        let wait = |app: &mut App, what: &str| {
+            for _ in 0..200 {
+                if app.term.as_ref().is_some_and(|t| t.said().contains(what)) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("never showed {what}: {:?}", app.term.as_ref().map(|t| t.said()));
+        };
+        wait(&mut app, "attached to job1");
+        for c in "quit".chars() {
+            assert_eq!(press(&mut app, KeyCode::Char(c)), Action::None, "keys go to claude, q too");
         }
         press(&mut app, KeyCode::Enter);
-        assert!(bridge::queued(&root, "s1")[0].ends_with("next message:\n\nquit now"));
-        assert!(app.input.is_empty() && app.note.starts_with("queued"), "{}", app.note);
-
-        // A permission request filed by the hook; 2 is "yes, don't ask again".
-        let me = std::process::id(); // a live hook's pid: a dead one's request is not asked
-        let filed = serde_json::json!({
-            "summary": "Bash: rm -rf build", "tool": "Bash", "input": { "command": "rm -rf build &&\n  make" },
-            "suggestions": [{ "type": "addRules", "rules": [{ "toolName": "Bash", "ruleContent": "rm -rf build:*" }], "behavior": "allow", "destination": "localSettings" }],
-        });
-        std::fs::write(root.join("s1").join(format!("ask-{me}.json")), filed.to_string()).unwrap();
-        app.poll_bridge();
-        assert_eq!(app.ask.as_ref().map(|a| a.summary.as_str()), Some("Bash: rm -rf build"));
-        let text = app.panel_lines(60, 30).iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("asks: Bash: rm -rf build") && text.contains("1 yes · 2 yes, don't ask again · 3 no"), "{text}");
-        assert!(text.contains("  rm -rf build &&\n    make"), "the whole call: {text}");
-        assert!(text.contains("2 saves: Bash(rm -rf build:*) (this project, just you)"), "{text}");
-        press(&mut app, KeyCode::Char('2'));
-        assert_eq!(std::fs::read_to_string(root.join("s1").join(format!("answer-{me}.json"))).unwrap(), "always");
-        assert_eq!(press(&mut app, KeyCode::Esc), Action::None);
-        assert!(!app.typing);
+        for _ in 0..200 {
+            app.poll_bridge();
+            if app.term.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.term.is_none() && app.note.contains("got quit"), "the attach ended: {}", app.note);
+        press(&mut app, KeyCode::Char('p'));
+        wait(&mut app, "attached to job1");
+        assert_eq!(press(&mut app, KeyCode::Esc), Action::None, "esc detaches, never quits");
+        assert!(app.term.is_none() && app.note.starts_with("detached"), "{}", app.note);
         assert_eq!(press(&mut app, KeyCode::Char('q')), Action::Quit, "the tree's keys again");
         let _ = std::fs::remove_dir_all(&root);
     }

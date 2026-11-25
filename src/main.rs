@@ -56,10 +56,9 @@ mod actors;
 mod bridge;
 mod cast;
 mod cli;
-mod commands;
 mod edit;
+mod embed;
 mod format;
-mod history;
 mod limits;
 mod markdown;
 mod patch;
@@ -183,7 +182,7 @@ fn show(out: &mut Counted, office: &RgbaImage, cast: &mut Cast, d: &Display, app
         while let Ok(s) = scans.try_recv() {
             app.set_snapshot(s);
         }
-        // The prompt panel's hooks hold permission requests only while office beats.
+        // The hook files permission requests only while office beats.
         if beat.is_none_or(|b| b.elapsed() >= Duration::from_secs(1)) {
             bridge::heartbeat(&app.bridge);
             beat = Some(Instant::now());
@@ -547,7 +546,6 @@ fn run(args: Args) -> Result<String, Box<dyn Error>> {
     let mut app = App::new(args.since, now() as u64);
     // Only here, never for --dump or --snapshot; nothing is fetched until the Usage tab shows.
     app.limits = Some(limits::Limits::new(limits::accounts(&home()), args.offline));
-    app.hooks = roots(&args).iter().filter_map(|r| r.dir.parent()).any(bridge::installed);
     let (scans, rescan) = scanner(roots(&args), args.since);
 
     let mut out = Counted::new().map_err(|e| format!("OFFICE_VIEW_TRACE: {e}"))?;
@@ -586,7 +584,7 @@ fn run(args: Args) -> Result<String, Box<dyn Error>> {
 }
 
 fn main() {
-    // `office hook ...`: the Claude Code hooks of the prompt panel (see bridge).
+    // `office hook ...`: the Claude Code hook that makes Waiting exact (see bridge).
     let argv: Vec<String> = env::args().skip(1).collect();
     if argv.first().map(String::as_str) == Some("hook") {
         process::exit(hook_command(argv.get(1).map_or("", String::as_str)));

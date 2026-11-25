@@ -1,4 +1,4 @@
-//! Markdown as the prompt panel shows a reply, close to Claude Code's own:
+//! Markdown as the session panel shows a reply, close to Claude Code's own:
 //! headings, lists, quotes, rules and fenced code by line; bold, italic,
 //! strikethrough, inline code and links within a line; all wrapped to a
 //! width with each piece keeping its style.

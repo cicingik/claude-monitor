@@ -9,11 +9,14 @@ base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "gif"] }
 # localtime_r (localtime_s on Windows), so times print in local time.
 libc = "0.2"
+portable-pty = "0.9"
 ratatui = "0.30"
 # No chafa: it needs libchafa at build and run time.
 ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
 # preserve_order: `office hook install` keeps the order of keys in settings.json.
 serde_json = { version = "1", features = ["preserve_order"] }
+tui-term = "0.3.4"
 # The account limits (5 h, 7 days) from Anthropic's OAuth usage endpoint.
 # rustls with ring and bundled roots: no OpenSSL, so build.sh still cross-builds.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+vt100 = "0.16"

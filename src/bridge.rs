@@ -1,23 +1,17 @@
 //! The bridge between office and running Claude Code sessions, through
 //! Claude Code's own hooks, so it works in any terminal (or none).
 //!
-//! office installs two hooks (`office hook install`), both this binary:
-//! - PermissionRequest runs `office hook permission`. While office runs, it
-//!   files the request as ask-<pid>.json and waits up to HOLD for office to
-//!   answer it (answer-<pid>.json): allow, allow and don't ask again, or deny.
-//!   Claude Code shows its own dialog meanwhile; answered there, the call's
-//!   result reaches the transcript and the hook lets go. When office is not
-//!   running, the hook returns at once.
-//! - Stop and SessionStart run `office hook wait` as an asyncRewake hook: it
-//!   waits in the background, never blocking the session, until office
-//!   leaves a prompt (prompt-<nanos>.txt, the text the session reads, which office
-//!   frames: see commands::message), then exits 2, which wakes the session with
-//!   it. One waiter per session: a newer one retires the older.
+//! office installs one hook (`office hook install`), this binary:
+//! PermissionRequest runs `office hook permission`. While office runs, it
+//! files the request as ask-<pid>.json, which makes the asking agent's
+//! Waiting exact (see overlay), until Claude Code's own dialog is answered:
+//! the call's result reaches the transcript, or HOLD passes. When office is
+//! not running, the hook returns at once. It never answers the request.
 //!
 //! Files live in $XDG_STATE_HOME/claude-monitor/bridge (else
 //! ~/.local/state/claude-monitor/bridge), one directory per session id, each
-//! file with one writer and written whole (to a temporary name, then renamed).
-//! `alive` is office's heartbeat: the hooks treat office as gone once it is
+//! file written whole (to a temporary name, then renamed).
+//! `alive` is office's heartbeat: the hook treats office as gone once it is
 //! older than STALE.
 
 use std::{
@@ -31,74 +25,14 @@ use std::{
 
 use serde_json::{Value, json};
 
-/// How long a permission request stays answerable from office. Claude Code's
-/// own dialog is up all along, so waiting costs the session nothing.
-pub const HOLD: Duration = Duration::from_secs(600);
+/// The longest a permission request stays filed. Claude Code's own dialog
+/// is up all along, so the hook costs the session nothing.
+const HOLD: Duration = Duration::from_secs(600);
 /// office counts as gone once its heartbeat is this old.
 const STALE: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(150);
-/// A waiter gives up after this long, so none outlives a forgotten session.
-const WAITER_LIFE: Duration = Duration::from_secs(24 * 3600);
 /// What every command office installs starts with, after the binary's path.
 const MARK: &str = " hook ";
-
-/// A permission request waiting for an answer.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Ask {
-    pub id: String,      // the hook's pid: names its files
-    pub summary: String, // the tool call, as the tree shows tool calls
-    pub at: SystemTime,  // when it was filed
-    pub questions: Vec<Question>, // AskUserQuestion's: answered by picking, not by yes or no
-    pub detail: Vec<String>, // the whole call, a line each: see detail()
-    pub rules: Vec<String>,  // what "don't ask again" saves: see rules()
-}
-
-/// One question of an AskUserQuestion call.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Question {
-    pub text: String,
-    pub options: Vec<(String, String)>, // label, description
-    pub multi: bool,                    // several may be picked (answers comma-separated)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Answer {
-    Allow,
-    AllowAlways, // allow, and add Claude Code's suggested rule so it asks no more
-    Deny,
-    Answers(Vec<(String, String)>), // AskUserQuestion: question text, answer
-}
-
-impl Answer {
-    /// The answer file's content.
-    fn body(&self) -> String {
-        match self {
-            Answer::Allow => "allow".into(),
-            Answer::AllowAlways => "always".into(),
-            Answer::Deny => "deny".into(),
-            Answer::Answers(a) => {
-                let map: serde_json::Map<String, Value> = a.iter().map(|(q, a)| (q.clone(), Value::from(a.as_str()))).collect();
-                json!({ "answers": map }).to_string()
-            }
-        }
-    }
-}
-
-/// AskUserQuestion's questions, from its input.
-fn questions(input: &Value) -> Vec<Question> {
-    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-    input
-        .get("questions")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(|q| Question {
-            text: s(q, "question"),
-            options: q.get("options").and_then(Value::as_array).into_iter().flatten().map(|o| (s(o, "label"), s(o, "description"))).collect(),
-            multi: q.get("multiSelect").and_then(Value::as_bool).unwrap_or(false),
-        })
-        .collect()
-}
 
 pub fn dir() -> PathBuf {
     let home = || env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default();
@@ -142,90 +76,12 @@ fn hook_alive(id: &str) -> bool {
     !cfg!(unix) || id.parse().is_ok_and(alive_pid)
 }
 
-/// The oldest permission request of session waiting for an answer.
-pub fn ask(root: &Path, session: &str) -> Option<Ask> {
-    let d = session_dir(root, session);
-    let mut asks: Vec<Ask> = fs::read_dir(&d)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let id = name.strip_prefix("ask-")?.strip_suffix(".json")?.to_string();
-            if !hook_alive(&id) {
-                return None;
-            }
-            let v: Value = serde_json::from_slice(&fs::read(e.path()).ok()?).ok()?;
-            let at = e.metadata().and_then(|m| m.modified()).ok()?;
-            let qs = v.get("questions").map(|q| questions(&json!({ "questions": q }))).unwrap_or_default();
-            let tool = v.get("tool").and_then(Value::as_str).unwrap_or("");
-            let (detail, rules) = (detail(tool, v.get("input").unwrap_or(&Value::Null)), rules(v.get("suggestions").unwrap_or(&Value::Null)));
-            Some(Ask { id, summary: v.get("summary")?.as_str()?.to_string(), at, questions: qs, detail, rules })
-        })
-        .collect();
-    asks.sort_by_key(|a| a.at);
-    asks.into_iter().next()
-}
-
-pub fn answer(root: &Path, session: &str, ask: &Ask, a: Answer) -> io::Result<()> {
-    put(&session_dir(root, session).join(format!("answer-{}.json", ask.id)), a.body().as_bytes())
-}
-
-/// The prompts left in d and not taken yet, oldest first: one file each,
-/// prompt-<unix nanos>.txt, so no send replaces another.
-fn prompts(d: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = fs::read_dir(d)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("prompt-") && n.ends_with(".txt")))
-        .collect();
-    out.sort();
-    out
-}
-
-/// Removes the prompt at p and gives its text, unless the other side
-/// removed it first (the waiter took it, or office took it back).
-fn claim(p: &Path) -> Option<String> {
-    let m = fs::read_to_string(p).ok()?;
-    fs::remove_file(p).ok()?;
-    Some(m)
-}
-
-/// Leaves a prompt for the session's waiter, after any not taken yet. Says
-/// whether a waiter is there to take it now.
-pub fn send(root: &Path, session: &str, prompt: &str) -> io::Result<bool> {
-    let d = session_dir(root, session);
-    let at = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_nanos();
-    put(&d.join(format!("prompt-{at:020}.txt")), prompt.as_bytes())?;
-    let waiter = fs::read_to_string(d.join("waiter")).ok().and_then(|p| p.trim().parse::<i64>().ok());
-    Ok(waiter.is_some_and(|p| !cfg!(unix) || alive_pid(p)))
-}
-
-/// Takes back the newest prompt left for the session and not taken yet:
-/// Ok(None) when there is none left.
-pub fn cancel(root: &Path, session: &str) -> io::Result<Option<String>> {
-    Ok(prompts(&session_dir(root, session)).iter().rev().find_map(|p| claim(p)))
-}
-
-/// The oldest prompt left in d, taken: what the waiter wakes the session with.
-fn take(d: &Path) -> Option<String> {
-    prompts(d).iter().find_map(|p| claim(p))
-}
-
-/// The prompts left for the session and not taken yet, oldest first.
-pub fn queued(root: &Path, session: &str) -> Vec<String> {
-    prompts(&session_dir(root, session)).iter().filter_map(|p| fs::read_to_string(p).ok()).collect()
-}
-
-// The hooks' side: `office hook permission` and `office hook wait`, with the
-// hook's JSON on stdin.
+// The hook's side: `office hook permission`, with the hook's JSON on stdin.
 
 /// Whether the session runs headless (`claude -p`, the Agent SDK), going by
 /// the CLAUDE_CODE_ENTRYPOINT its hooks see: "sdk-cli", "sdk-ts", ... Such a
-/// run ends on its own, and waits for its async hooks first: a waiter would
-/// hang it, and a held request would stall it, so the hooks do nothing there.
+/// run ends on its own, and a held request would stall it, so the hook does
+/// nothing there.
 fn headless(entrypoint: Option<&str>) -> bool {
     entrypoint.is_some_and(|e| e.starts_with("sdk"))
 }
@@ -245,18 +101,10 @@ pub fn hook(kind: &str, root: &Path) -> i32 {
     let d = session_dir(root, session);
     match kind {
         "permission" => {
-            if let Some(out) = permission(&d, root, &v) {
-                println!("{out}");
-            }
+            permission(&d, root, &v);
             0
         }
-        "wait" => match wait(&d) {
-            Some(prompt) => {
-                eprintln!("{prompt}");
-                2
-            }
-            None => 0,
-        },
+        // `wait`, the prompt waiter older installs run, does nothing now.
         _ => 0,
     }
 }
@@ -265,47 +113,39 @@ fn alive(root: &Path) -> bool {
     age(&root.join("alive")).is_some_and(|a| a < STALE)
 }
 
-/// Files the request and waits for office's answer: the hook's output, or
-/// None to leave it to Claude Code's dialog.
-fn permission(d: &Path, root: &Path, v: &Value) -> Option<String> {
+/// Files the request until Claude Code's dialog is answered, office is
+/// gone, or HOLD passes.
+fn permission(d: &Path, root: &Path, v: &Value) {
     if !alive(root) {
-        return None;
+        return;
     }
     let tool = v.get("tool_name").and_then(Value::as_str).unwrap_or("");
     let summary = crate::scan::tool_summary(tool, v.get("tool_input").unwrap_or(&Value::Null), 200);
-    let id = process::id().to_string();
-    let (ask, ans) = (d.join(format!("ask-{id}.json")), d.join(format!("answer-{id}.json")));
-    let qs = if tool == "AskUserQuestion" { v.get("tool_input").and_then(|i| i.get("questions")).cloned() } else { None };
+    let ask = d.join(format!("ask-{}.json", process::id()));
     let agent = v.get("agent_id").and_then(Value::as_str).unwrap_or("");
-    let (input, suggestions) = (v.get("tool_input").cloned().unwrap_or(Value::Null), v.get("permission_suggestions").cloned().unwrap_or(Value::Null));
-    let filed = json!({ "summary": summary, "questions": qs, "agent": agent, "tool": tool, "input": input, "suggestions": suggestions });
-    put(&ask, filed.to_string().as_bytes()).ok()?;
-    // Claude Code shows its own dialog meanwhile and leaves this hook running
-    // when it is answered there: the call's tool_result in the transcript of
-    // the agent that asked says so.
+    if put(&ask, json!({ "summary": summary, "agent": agent }).to_string().as_bytes()).is_err() {
+        return;
+    }
+    // Claude Code leaves this hook running when its dialog is answered: the
+    // call's tool_result in the transcript of the agent that asked says so.
     let mut watch = transcript(v).map(|p| (fs::metadata(&p).map_or(0, |m| m.len()), p));
     let start = SystemTime::now();
-    let got = loop {
-        if let Ok(a) = fs::read_to_string(&ans) {
-            break Some(a);
-        }
+    loop {
         if !alive(root) || start.elapsed().unwrap_or_default() >= HOLD {
-            break None;
+            break;
         }
         if let Some((from, p)) = &mut watch
             && let Ok(b) = fs::read(&*p)
             && b.len() as u64 > *from
         {
             if b[*from as usize..].windows(13).any(|w| w == b"\"tool_result\"") {
-                break None;
+                break;
             }
             *from = b.len() as u64;
         }
         thread::sleep(POLL);
-    };
+    }
     let _ = fs::remove_file(&ask);
-    let _ = fs::remove_file(&ans);
-    decision(got?.trim(), v)
 }
 
 /// The transcript of the agent a hook fires for: the session's, or a
@@ -318,139 +158,13 @@ fn transcript(v: &Value) -> Option<PathBuf> {
     }
 }
 
-/// The whole of a tool call a permission request is for, a line each, as
-/// the panel shows it: a command as written; an edit's file, then its old
-/// lines after `- ` and new ones after `+ `; a write's file, then its lines;
-/// anything else as `key: value`.
-pub fn detail(tool: &str, input: &Value) -> Vec<String> {
-    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-    let lines = |prefix: &str, text: &str| text.lines().map(|l| format!("{prefix}{l}")).collect::<Vec<_>>();
-    let edit = |e: &Value| [lines("- ", &s(e, "old_string")), lines("+ ", &s(e, "new_string"))].concat();
-    match tool {
-        "Bash" => lines("", &s(input, "command")),
-        "Edit" => [vec![s(input, "file_path")], edit(input)].concat(),
-        "MultiEdit" => {
-            let edits = input.get("edits").and_then(Value::as_array).into_iter().flatten();
-            std::iter::once(s(input, "file_path")).chain(edits.flat_map(edit)).collect()
-        }
-        "Write" => [vec![s(input, "file_path")], lines("+ ", &s(input, "content"))].concat(),
-        _ => input
-            .as_object()
-            .into_iter()
-            .flatten()
-            .map(|(k, v)| format!("{k}: {}", v.as_str().map_or_else(|| v.to_string(), str::to_string)))
-            .collect(),
-    }
-}
-
-/// What answering "yes, don't ask again" saves, from the request's
-/// permission_suggestions: `Bash(npm test:*) (this project)`, a folder it
-/// may use, or a permission mode, each with where it is saved.
-pub fn rules(suggestions: &Value) -> Vec<String> {
-    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-    let mut out = Vec::new();
-    for u in suggestions.as_array().into_iter().flatten() {
-        let place = match s(u, "destination").as_str() {
-            "session" => " (this session)",
-            "localSettings" => " (this project, just you)",
-            "projectSettings" => " (this project)",
-            "userSettings" => " (all projects)",
-            _ => "",
-        };
-        let what: Vec<String> = match s(u, "type").as_str() {
-            "addRules" | "replaceRules" => u.get("rules").and_then(Value::as_array).into_iter().flatten().map(|r| match s(r, "ruleContent") {
-                c if c.is_empty() => s(r, "toolName"),
-                c => format!("{}({c})", s(r, "toolName")),
-            }).collect(),
-            "addDirectories" => u.get("directories").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(|d| format!("folder {}", tilde(d))).collect(),
-            "setMode" => vec![format!("mode {}", s(u, "mode"))],
-            t => vec![t.to_string()],
-        };
-        out.extend(what.into_iter().filter(|w| !w.is_empty()).map(|w| format!("{w}{place}")));
-    }
-    out
-}
-
-/// The PermissionRequest hook's output for office's answer.
-/// For AskUserQuestion, the picked answers go into its input, as its own dialog does.
-fn decision(answer: &str, v: &Value) -> Option<String> {
-    let suggestions = v.get("permission_suggestions");
-    let d = match answer {
-        a if a.starts_with('{') => {
-            let answers = serde_json::from_str::<Value>(a).ok()?.get("answers")?.clone();
-            let mut input = v.get("tool_input").cloned().filter(Value::is_object).unwrap_or_else(|| json!({}));
-            input.as_object_mut().expect("an object").insert("answers".into(), answers);
-            json!({ "behavior": "allow", "updatedInput": input })
-        }
-        "allow" => json!({ "behavior": "allow" }),
-        "always" => match suggestions.filter(|s| s.as_array().is_some_and(|a| !a.is_empty())) {
-            Some(s) => json!({ "behavior": "allow", "updatedPermissions": s }),
-            None => json!({ "behavior": "allow" }),
-        },
-        "deny" => json!({ "behavior": "deny", "message": "The user denied this from claude-monitor." }),
-        _ => return None,
-    };
-    Some(json!({ "hookSpecificOutput": { "hookEventName": "PermissionRequest", "decision": d } }).to_string())
-}
-
-/// Waits for a prompt for the session, as its only waiter: the prompt, or
-/// None once a newer waiter took over, Claude Code is gone, or WAITER_LIFE passed.
-fn wait(d: &Path) -> Option<String> {
-    let me = process::id().to_string();
-    let waiter = d.join("waiter");
-    put(&waiter, me.as_bytes()).ok()?;
-    let session = session_pid();
-    let start = SystemTime::now();
-    let mut beat = 0u32;
-    let out = loop {
-        if fs::read_to_string(&waiter).ok().as_deref() != Some(me.as_str()) {
-            return None; // retired: the newer waiter owns the file
-        }
-        if let Some(p) = take(d) {
-            break Some(p);
-        }
-        beat += 1;
-        if start.elapsed().unwrap_or_default() >= WAITER_LIFE || (session > 0 && beat.is_multiple_of(20) && !alive_pid(session.into())) {
-            break None;
-        }
-        thread::sleep(POLL);
-    };
-    if fs::read_to_string(&waiter).ok().as_deref() == Some(me.as_str()) {
-        let _ = fs::remove_file(&waiter);
-    }
-    out
-}
-
-/// The Claude Code process this hook runs for. Claude Code runs a hook
-/// command through a shell (`/bin/sh -c ...`), which outlives a killed
-/// session while this process runs: the shell's parent is the session.
-#[cfg(unix)]
-fn session_pid() -> i32 {
-    // SAFETY: getppid takes nothing and cannot fail.
-    let parent = unsafe { libc::getppid() };
-    let comm = fs::read_to_string(format!("/proc/{parent}/comm")).unwrap_or_default();
-    if !matches!(comm.trim(), "sh" | "bash" | "dash" | "zsh") {
-        return parent;
-    }
-    // /proc/<pid>/stat: "pid (comm) state ppid ...", comm in parentheses.
-    let stat = fs::read_to_string(format!("/proc/{parent}/stat")).unwrap_or_default();
-    stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse().ok()).unwrap_or(parent)
-}
-#[cfg(not(unix))]
-fn session_pid() -> i32 {
-    0 // not known: the waiter then lives until a prompt, a newer waiter, or WAITER_LIFE
-}
-
 // Installing the hooks into a Claude Code config directory's settings.json.
 
 /// The hook entries office adds, run by exe.
-fn entries(exe: &str) -> [(&'static str, Value); 3] {
+fn entries(exe: &str) -> [(&'static str, Value); 1] {
     let cmd = |kind: &str| format!("\"{exe}\"{MARK}{kind}");
     let permission = json!({ "matcher": "*", "hooks": [{ "type": "command", "command": cmd("permission"), "timeout": HOLD.as_secs() + 30 }] });
-    // Claude Code kills a hook after its timeout, async ones too (600 s by
-    // default): the waiter must outlive an idle session's quiet hours.
-    let wait = json!({ "hooks": [{ "type": "command", "command": cmd("wait"), "asyncRewake": true, "timeout": WAITER_LIFE.as_secs() }] });
-    [("PermissionRequest", permission), ("Stop", wait.clone()), ("SessionStart", wait)]
+    [("PermissionRequest", permission)]
 }
 
 /// Whether an entry of a hooks list runs office.
@@ -511,17 +225,6 @@ pub fn install(config_dir: &Path, exe: Option<&str>) -> io::Result<()> {
     put(&path, &body)
 }
 
-/// Whether config_dir/settings.json runs office's hooks as this office
-/// installs them: an older install's waiter dies after Claude Code's default
-/// hook timeout.
-pub fn installed(config_dir: &Path) -> bool {
-    let Ok(b) = fs::read(config_dir.join("settings.json")) else { return false };
-    let Ok(v) = serde_json::from_slice::<Value>(&b) else { return false };
-    let ours = |event: &str| v.get("hooks").and_then(|h| h.get(event)).and_then(Value::as_array).into_iter().flatten().filter(|e| is_ours(e)).cloned().collect::<Vec<_>>();
-    let waits = |e: &Value| e["hooks"][0]["timeout"].as_u64().is_some_and(|t| t >= WAITER_LIFE.as_secs());
-    !ours("PermissionRequest").is_empty() && ["Stop", "SessionStart"].iter().all(|ev| ours(ev).iter().any(waits))
-}
-
 /// `office hook install|uninstall`, over every config dir: a report line each.
 pub fn manage(install_it: bool, config_dirs: &[PathBuf], out: &mut impl Write) -> io::Result<()> {
     let exe = env::current_exe()?.to_string_lossy().into_owned();
@@ -580,6 +283,40 @@ pub fn live_ids(config_dir: &Path) -> std::collections::HashSet<String> {
             Some(v.get("sessionId")?.as_str()?.to_string())
         })
         .collect()
+}
+
+/// Which Claude Code process holds a session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Holder {
+    None,
+    Background { job: String }, // `claude --bg`'s: `claude attach <job>` shows it
+    Terminal,                   // a claude open in a terminal of its own
+}
+
+/// Who holds session (its id, as the scan names it) of config_dir, from
+/// the sessions/<pid>.json of running Claude Code processes.
+pub fn holder(config_dir: &Path, session: &str) -> Holder {
+    let raw = session.split('@').next().unwrap_or(session);
+    for e in fs::read_dir(config_dir.join("sessions")).into_iter().flatten().flatten() {
+        let Ok(v) = serde_json::from_slice::<Value>(&fs::read(e.path()).unwrap_or_default()) else { continue };
+        let s = |k: &str| v.get(k).and_then(Value::as_str);
+        // Off unix a pid is not checked: a stale file's attach says so itself.
+        if s("sessionId") != Some(raw) || !v.get("pid").and_then(Value::as_i64).is_some_and(|p| !cfg!(unix) || alive_pid(p)) {
+            continue;
+        }
+        return match (s("kind"), s("jobId")) {
+            (Some("bg"), Some(job)) => Holder::Background { job: job.into() },
+            _ => Holder::Terminal,
+        };
+    }
+    Holder::None
+}
+
+/// `claude attach <job>` in session's folder under config_dir, for the panel's terminal.
+pub fn attach(program: &Path, config_dir: &Path, cwd: &str, job: &str) -> io::Result<process::Command> {
+    let mut cmd = claude(program, config_dir, cwd)?;
+    cmd.args(["attach", job]);
+    Ok(cmd)
 }
 
 #[cfg(unix)]
@@ -701,12 +438,12 @@ pub fn launch_failed(said: &str, config_dir: &Path, cwd: &str, launch: &Launch) 
     };
     if said.contains("is your home directory") {
         return format!(
-            "{not}: {it} your home directory, and Claude Code never runs those in the background (it never saves trust for home). Press o to run it here (office comes back when you exit Claude), or in a terminal: cd ~ && {account}{claude}"
+            "{not}: {it} your home directory, and Claude Code never runs those in the background (it never saves trust for home). Press p to run it here (office comes back when you exit Claude), or in a terminal: cd ~ && {account}{claude}"
         );
     }
     if said.contains("Workspace not trusted") {
         return format!(
-            "{not}: {} is not trusted for {} yet (a trusted parent folder is not enough in the background). Press o to run it here and accept the trust prompt (office comes back when you exit Claude), or run this once in a terminal: cd {} && {account}claude",
+            "{not}: {} is not trusted for {} yet (a trusted parent folder is not enough in the background). Press p to run it here and accept the trust prompt (office comes back when you exit Claude), or run this once in a terminal: cd {} && {account}claude",
             tilde(cwd),
             tilde(&config_dir.to_string_lossy()),
             tilde(cwd)
@@ -728,6 +465,15 @@ pub(crate) fn tilde(path: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The summary of the request the hook filed for session, if one is.
+    fn filed(root: &Path, session: &str) -> Option<String> {
+        let d = fs::read_dir(root.join(session)).ok()?;
+        d.flatten().find(|e| e.file_name().to_string_lossy().starts_with("ask-")).and_then(|e| {
+            let v: Value = serde_json::from_slice(&fs::read(e.path()).ok()?).ok()?;
+            Some(v.get("summary")?.as_str()?.to_string())
+        })
+    }
+
     fn tmp(name: &str) -> PathBuf {
         let d = env::temp_dir().join(format!("office-bridge-{name}-{}", process::id()));
         let _ = fs::remove_dir_all(&d);
@@ -735,21 +481,21 @@ mod tests {
         d
     }
 
-    /// Prompts sent before the session takes one queue up, each its own:
-    /// the waiter takes the oldest, ctrl+x takes back the newest.
+    /// A background session is attached by its job id; one open in a
+    /// terminal, or held by a process gone, is not.
     #[test]
-    fn prompts_queue_in_order_and_none_replaces_another() {
-        let root = tmp("queue");
-        for p in ["first", "second", "third"] {
-            send(&root, "s1", p).unwrap();
-        }
-        assert_eq!(queued(&root, "s1"), ["first", "second", "third"]);
-        assert_eq!(take(&session_dir(&root, "s1")).as_deref(), Some("first"));
-        assert_eq!(cancel(&root, "s1").unwrap().as_deref(), Some("third"));
-        assert_eq!(queued(&root, "s1"), ["second"]);
-        assert_eq!(take(&session_dir(&root, "s1")).as_deref(), Some("second"));
-        assert_eq!((take(&session_dir(&root, "s1")), cancel(&root, "s1").unwrap()), (None, None));
-        assert!(queued(&root, "s1").is_empty());
+    fn holder_tells_background_sessions_from_terminal_ones() {
+        let d = tmp("holder");
+        fs::create_dir_all(d.join("sessions")).unwrap();
+        let me = process::id();
+        let put = |n: &str, v: Value| fs::write(d.join("sessions").join(n), v.to_string()).unwrap();
+        put("1.json", json!({"pid": me, "sessionId": "bg-1", "kind": "bg", "jobId": "bg"}));
+        put("2.json", json!({"pid": me, "sessionId": "tty-1", "kind": "interactive"}));
+        put("3.json", json!({"pid": i32::MAX, "sessionId": "gone-1", "kind": "bg", "jobId": "gone"}));
+        assert_eq!(holder(&d, "bg-1@work"), Holder::Background { job: "bg".into() });
+        assert_eq!(holder(&d, "tty-1"), Holder::Terminal);
+        assert_eq!(holder(&d, "gone-1"), Holder::None);
+        assert_eq!(holder(&d, "never"), Holder::None);
     }
 
     /// Installing keeps every other setting and hook, twice is once, and
@@ -759,24 +505,18 @@ mod tests {
         let d = tmp("install");
         let theirs = json!({ "model": "opus", "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "notify-send done" }] }] }, "z": 1 });
         fs::write(d.join("settings.json"), serde_json::to_vec_pretty(&theirs).unwrap()).unwrap();
-        assert!(!installed(&d));
+        // An older install's prompt waiter, which installing again removes.
+        let mut old = theirs.clone();
+        old["hooks"]["Stop"].as_array_mut().unwrap().push(json!({ "hooks": [{ "type": "command", "command": "\"/opt/office\" hook wait", "asyncRewake": true }] }));
+        old["hooks"]["SessionStart"] = json!([{ "hooks": [{ "type": "command", "command": "\"/opt/office\" hook wait" }] }]);
+        fs::write(d.join("settings.json"), serde_json::to_vec_pretty(&old).unwrap()).unwrap();
         install(&d, Some("/opt/office")).unwrap();
         install(&d, Some("/opt/office")).unwrap();
-        assert!(installed(&d));
         let v: Value = serde_json::from_slice(&fs::read(d.join("settings.json")).unwrap()).unwrap();
         assert_eq!(v["model"], "opus");
-        assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 2, "theirs and ours, once: {v}");
-        assert_eq!(v["hooks"]["Stop"][1]["hooks"][0]["asyncRewake"], true);
-        for event in ["Stop", "SessionStart"] {
-            let ours = v["hooks"][event].as_array().unwrap().last().unwrap();
-            assert_eq!(ours["hooks"][0]["timeout"], WAITER_LIFE.as_secs(), "Claude Code would kill the waiter after its default 600 s: {event}");
-        }
-        let mut old = v.clone();
-        old["hooks"]["Stop"][1]["hooks"][0].as_object_mut().unwrap().remove("timeout");
-        fs::write(d.join("settings.json"), serde_json::to_vec_pretty(&old).unwrap()).unwrap();
-        assert!(!installed(&d), "an install from before the waiter's timeout is out of date");
-        install(&d, Some("/opt/office")).unwrap();
-        assert!(installed(&d), "installing again brings it up to date");
+        assert_eq!(v["hooks"]["Stop"], theirs["hooks"]["Stop"], "theirs only, the old waiter gone: {v}");
+        assert!(v["hooks"].get("SessionStart").is_none(), "{v}");
+        assert_eq!(v["hooks"]["PermissionRequest"].as_array().unwrap().len(), 1, "ours, once: {v}");
         assert_eq!(v["hooks"]["PermissionRequest"][0]["hooks"][0]["command"], "\"/opt/office\" hook permission");
         let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
         assert_eq!(keys, ["model", "hooks", "z"], "the user's key order is kept");
@@ -787,44 +527,27 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// office's answers become the hook's decisions; "don't ask again"
-    /// hands back Claude Code's own suggestion.
+    /// While office runs, the hook files the request for the tree's Waiting;
+    /// once office is gone it cleans up and lets go.
     #[test]
-    fn answers_become_decisions() {
-        let sugg = json!([{ "type": "addRules", "rules": [{ "toolName": "Bash", "ruleContent": "ls:*" }], "behavior": "allow", "destination": "localSettings" }]);
-        let v = json!({ "permission_suggestions": sugg, "tool_input": { "questions": [{ "question": "Color?" }] } });
-        let get = |a: &str| decision(a, &v).map(|s| serde_json::from_str::<Value>(&s).unwrap()["hookSpecificOutput"]["decision"].clone());
-        assert_eq!(get("allow"), Some(json!({ "behavior": "allow" })));
-        assert_eq!(get("always"), Some(json!({ "behavior": "allow", "updatedPermissions": sugg })));
-        assert_eq!(get("deny").unwrap()["behavior"], "deny");
-        assert_eq!(get("terminal"), None);
-        let picked = Answer::Answers(vec![("Color?".into(), "Blue".into())]).body();
-        assert_eq!(get(&picked), Some(json!({ "behavior": "allow", "updatedInput": { "questions": [{ "question": "Color?" }], "answers": { "Color?": "Blue" } } })));
-    }
-
-    /// The whole round trip with a real hook process: office alive, the hook
-    /// files its request, office sees and answers it, the hook prints the decision.
-    #[test]
-    fn a_permission_request_waits_for_office() {
+    fn a_permission_request_is_filed_while_office_runs() {
         let root = tmp("perm");
         heartbeat(&root);
         let v = json!({ "session_id": "s1", "tool_name": "Bash", "tool_input": { "command": "rm -rf build" } });
         let r = root.clone();
         let hook = thread::spawn(move || permission(&r.join("s1"), &r, &v));
-        let a = (0..100).find_map(|_| {
+        let summary = (0..100).find_map(|_| {
             thread::sleep(POLL);
             heartbeat(&root);
-            ask(&root, "s1@work")
+            filed(&root, "s1")
         });
-        let a = a.expect("the request shows up for office");
-        assert_eq!(a.summary, "Bash: rm -rf build");
-        answer(&root, "s1", &a, Answer::Deny).unwrap();
-        let out: Value = serde_json::from_str(&hook.join().unwrap().expect("a decision")).unwrap();
-        assert_eq!(out["hookSpecificOutput"]["decision"]["behavior"], "deny");
-        assert_eq!(ask(&root, "s1"), None, "the hook cleans up");
+        assert_eq!(summary.as_deref(), Some("Bash: rm -rf build"), "the request shows up for office");
         leave(&root);
+        hook.join().unwrap();
+        assert_eq!(filed(&root, "s1"), None, "office gone: the hook cleans up and returns");
         let v = json!({ "session_id": "s1", "tool_name": "Bash", "tool_input": {} });
-        assert_eq!(permission(&root.join("s1"), &root, &v), None, "office gone: left to Claude Code's dialog at once");
+        permission(&root.join("s1"), &root, &v);
+        assert_eq!(filed(&root, "s1"), None, "office not running: nothing is filed");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -841,41 +564,14 @@ mod tests {
         let v = json!({ "session_id": "s1", "transcript_path": main, "agent_id": "a7", "tool_name": "Bash", "tool_input": {} });
         let r = root.clone();
         let hook = thread::spawn(move || permission(&r.join("s1"), &r, &v));
-        while ask(&root, "s1").is_none() {
+        while filed(&root, "s1").is_none() {
             thread::sleep(POLL);
             heartbeat(&root);
         }
         let mut f = fs::OpenOptions::new().append(true).open(&sub).unwrap();
         writeln!(f, r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"t"}}]}}}}"#).unwrap();
-        assert_eq!(hook.join().unwrap(), None);
-        assert_eq!(ask(&root, "s1"), None, "nothing left for the panel");
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// A waiter takes the prompt office leaves; a newer waiter retires an older one.
-    #[test]
-    fn a_waiter_takes_the_prompt() {
-        let root = tmp("wait");
-        let d = root.join("s1");
-        let first = {
-            let d = d.clone();
-            thread::spawn(move || wait(&d))
-        };
-        while !d.join("waiter").exists() {
-            thread::sleep(POLL);
-        }
-        put(&d.join("waiter"), b"someone-newer").unwrap();
-        assert_eq!(first.join().unwrap(), None, "retired");
-        let second = {
-            let d = d.clone();
-            thread::spawn(move || wait(&d))
-        };
-        while fs::read_to_string(d.join("waiter")).ok().as_deref() != Some(process::id().to_string().as_str()) {
-            thread::sleep(POLL);
-        }
-        assert!(send(&root, "s1@work", "run the tests").unwrap(), "a waiter is there");
-        assert_eq!(second.join().unwrap().as_deref(), Some("run the tests"));
-        assert!(queued(&root, "s1").is_empty() && !d.join("waiter").exists());
+        hook.join().unwrap();
+        assert_eq!(filed(&root, "s1"), None, "answered in its dialog: the request is gone");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -894,7 +590,7 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// `claude -p` and SDK runs get no waiter and no held request; terminal
+    /// `claude -p` and SDK runs get no held request; terminal
     /// sessions, background ones and unknown entrypoints do.
     #[test]
     fn headless_runs_are_left_alone() {
@@ -924,9 +620,6 @@ mod tests {
         assert_eq!((snap.by_id["a7"].status, snap.by_id["a7"].last_tool.as_str()), (Status::Waiting, "Bash: make"));
         assert_eq!(snap.by_id["a8"].status, Status::Running);
         assert_eq!(snap.by_id["s1@work"].status, Status::Running, "its hook is gone");
-        assert_eq!(ask(&root, "s1").map(|a| a.summary), Some("Bash: make".into()), "the panel asks only what a live hook waits on");
-        fs::remove_file(root.join("s1").join(format!("ask-{me}.json"))).unwrap();
-        assert_eq!(ask(&root, "s1"), None, "a dead hook's question is not asked");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -940,7 +633,7 @@ mod tests {
         let said = format!("Workspace not trusted. Run `claude` in {cwd} once and accept the trust prompt, then retry.");
         let (s1, s1_work, new) = (Launch::Resume("s1".into()), Launch::Resume("s1@work".into()), Launch::New("hi".into()));
         let m = launch_failed(&said, &work, &cwd, &s1_work);
-        assert!(m.contains("~/dev/api is not trusted for ~/.claude-work yet") && m.contains("Press o to run it here") && m.ends_with("cd ~/dev/api && CLAUDE_CONFIG_DIR=~/.claude-work claude"), "{m}");
+        assert!(m.contains("~/dev/api is not trusted for ~/.claude-work yet") && m.contains("Press p to run it here") && m.ends_with("cd ~/dev/api && CLAUDE_CONFIG_DIR=~/.claude-work claude"), "{m}");
         assert!(needs_terminal(&said) && !needs_terminal("boom"));
         assert!(launch_failed(&said, &dflt, &cwd, &s1).ends_with("cd ~/dev/api && claude"), "the default account needs no CLAUDE_CONFIG_DIR");
         assert!(launch_failed(&said, &work, &cwd, &new).starts_with("not started: ~/dev/api is not trusted"));
@@ -952,23 +645,6 @@ mod tests {
         assert_eq!(launch_failed("boom", &work, &cwd, &s1), "not resumed: boom");
         let gone = start(Path::new("claude"), &work, "/nonexistent/office-gone", &s1).unwrap_err();
         assert_eq!(gone.to_string(), "its folder /nonexistent/office-gone no longer exists");
-    }
-
-    /// A request shows its whole call, an edit as a diff, and what "don't
-    /// ask again" saves, where.
-    #[test]
-    fn a_request_shows_its_whole_call_and_what_always_saves() {
-        assert_eq!(detail("Bash", &json!({ "command": "cargo build &&\n  cargo test" })), ["cargo build &&", "  cargo test"]);
-        let edit = json!({ "file_path": "/p/a.rs", "old_string": "x\ny", "new_string": "z" });
-        assert_eq!(detail("Edit", &edit), ["/p/a.rs", "- x", "- y", "+ z"]);
-        assert_eq!(detail("WebFetch", &json!({ "url": "https://x", "n": 2 })), ["url: https://x", "n: 2"], "in the call's own order");
-        let s = json!([
-            { "type": "addRules", "rules": [{ "toolName": "Bash", "ruleContent": "npm test:*" }, { "toolName": "Read" }], "behavior": "allow", "destination": "projectSettings" },
-            { "type": "addDirectories", "directories": ["/tmp/x"], "destination": "session" },
-            { "type": "setMode", "mode": "acceptEdits", "destination": "session" },
-        ]);
-        assert_eq!(rules(&s), ["Bash(npm test:*) (this project)", "Read (this project)", "folder /tmp/x (this session)", "mode acceptEdits (this session)"]);
-        assert!(rules(&Value::Null).is_empty());
     }
 
     /// An account trusts the folders its .claude.json accepted the trust

@@ -1,4 +1,4 @@
-//! Draws the tree view: the header, the tree, the prompt panel's box and the detail tabs.
+//! Draws the tree view: the header, the tree, the session panel and the detail tabs.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -85,30 +85,37 @@ impl App {
         let (tree_h, panel_h) = self.left_heights();
         let tree_h = tree_h.min(body_h);
         let left = Rect::new(area.x, area.y + 1, lw, tree_h);
-        let panel = Rect::new(area.x, area.y + 1 + tree_h, lw, panel_h.min(body_h - tree_h));
-        let right = Rect::new(area.x + lw, area.y + 1, rw, body_h);
+        // Claude Code's terminal takes the panel's rows across the whole width.
+        let (panel_w, right_h) = if self.term.is_some() { (area.width, tree_h) } else { (lw, body_h) };
+        let panel = Rect::new(area.x, area.y + 1 + tree_h, panel_w, panel_h.min(body_h - tree_h));
+        let right = Rect::new(area.x + lw, area.y + 1, rw, right_h);
         self.panes.set([left, panel, right].map(|r| r.inner(Margin::new(1, 1))));
         let (tw, th) = (usize::from(lw.saturating_sub(2)), usize::from(tree_h.saturating_sub(2)));
         match &self.picker {
             Some(_) => f.render_widget(Paragraph::new(self.picker_lines(tw, th)).block(block().border_style(Style::new().fg(Color::Indexed(208)))), left),
             None => f.render_widget(Paragraph::new(self.tree_lines(tw)).block(block()), left),
         }
-        let edge = if self.typing { Color::Indexed(208) } else { Color::Indexed(240) };
-        let title = Span::styled(" prompt ", Style::new().fg(edge));
-        let panel_block = block().border_style(Style::new().fg(edge)).title(title);
-        let lines = self.panel_lines(usize::from(lw.saturating_sub(2)), usize::from(panel.height.saturating_sub(2)));
-        f.render_widget(Paragraph::new(lines).block(panel_block), panel);
+        if let Some(t) = &self.term {
+            let orange = Style::new().fg(Color::Indexed(208));
+            let name = self.agent(&t.session).map(session_row).unwrap_or_default();
+            f.render_widget(block().border_style(orange).title(Span::styled(format!(" claude · {} ", truncate(&name, usize::from(panel_w).saturating_sub(16))), orange)), panel);
+            t.draw(f, panel.inner(Margin::new(1, 1)));
+        } else {
+            let panel_block = block().title(Span::styled(" session ", Style::new().fg(Color::Indexed(240))));
+            let lines = self.panel_lines(usize::from(lw.saturating_sub(2)), usize::from(panel.height.saturating_sub(2)));
+            f.render_widget(Paragraph::new(lines).block(panel_block), panel);
+        }
         if rw > 2 {
             f.render_widget(Paragraph::new(self.detail_lines(usize::from(rw - 2))).block(block()), right);
         }
-        let keys: &[(&str, &str)] = if self.picker.as_ref().is_some_and(|p| p.picked()) {
+        let keys: &[(&str, &str)] = if self.term.is_some() {
+            &[("keys", "go to Claude Code"), ("ctrl+c", "interrupt it"), ("esc", "detach, back to the tree (the session runs on)")]
+        } else if self.picker.as_ref().is_some_and(|p| p.picked()) {
             &[("enter", "start it"), ("ctrl+t", "account"), ("esc", "another folder"), ("ctrl+c", "quit")]
         } else if self.picker.is_some() {
             &[("↑/↓", "pick"), ("tab", "complete"), ("enter", "this folder"), ("ctrl+t", "account"), ("esc", "close"), ("ctrl+c", "quit")]
-        } else if self.typing {
-            &[("enter", "send prompt"), ("/", "commands, tab completes"), ("←/→", "cursor"), ("pgup/pgdn", "scroll"), ("digits", "answer (empty prompt)"), ("↑/↓", "history"), ("ctrl+x", "take back a waiting prompt"), ("esc", "back to tree"), ("ctrl+c", "quit")]
         } else {
-            &[("↑/k", "up"), ("↓/j", "down"), ("enter", "collapse/expand"), ("p", "prompt"), ("o", "resume session"), ("n", "new session"), ("tab", "next tab"), ("1-3", "tab"), ("v", "office"), ("r", "rescan"), ("q", "quit")]
+            &[("↑/k", "up"), ("↓/j", "down"), ("enter", "collapse/expand"), ("p", "open in Claude Code"), ("pgup/pgdn", "scroll the session"), ("n", "new session"), ("tab", "next tab"), ("1-3", "tab"), ("v", "office"), ("r", "rescan"), ("q", "quit")]
         };
         Self::line(f, area, area.y + 1 + body_h, help(keys));
     }

@@ -28,12 +28,13 @@ office: one room for every session. Agents of active sessions (running or active
 
 keys: click an agent (visitors too): select it and open its card (name, what it
       did, whom it dealt with); click elsewhere or esc: close it · i open/close the card
-      ↑/↓ k/j tab wheel select · enter open in tree · p prompt its session · v tree view
+      ↑/↓ k/j tab wheel select · enter open in tree · p open its session in Claude Code · v tree view
       r rescan · q esc ctrl+c quit; in the tree: enter/space collapse, tab 1 2 3 tabs
 
-prompt panel (under the tree; p): send a prompt to the selected session, or answer
-      its permission request (1 yes · 2 yes, don't ask again · 3 no).
-      Needs Claude Code hooks, once: office hook install (office hook uninstall removes them)
+session panel (under the tree): the selected session's conversation; p opens
+      Claude Code's own terminal for it there (claude attach), esc detaches.
+      Exact waiting status needs a Claude Code hook, once: office hook install
+      (office hook uninstall removes it)
 
 env: OFFICE_VIEW_TRACE=FILE  also append every byte written to the terminal to FILE
       (not the queries that detect the protocol and cell size)";

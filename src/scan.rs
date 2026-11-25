@@ -99,7 +99,7 @@ impl Usage {
 }
 
 /// One entry of an agent's recent activity. The summary is always short;
-/// a prompt or a reply also keeps its whole text, for the prompt panel.
+/// a prompt or a reply also keeps its whole text, for the session panel.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Event {
     pub at: i64,

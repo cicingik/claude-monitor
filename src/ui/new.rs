@@ -17,7 +17,6 @@ use ratatui::{
 use crate::{
     bridge::{self, tilde},
     edit::LineEdit,
-    history,
     scan::truncate,
 };
 
@@ -56,11 +55,6 @@ impl Picker {
         if self.folder.is_none() {
             self.at = 0;
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn input_text(&self) -> String {
-        self.input.text()
     }
 
     /// Whether the folder is picked: the input is the first prompt.
@@ -127,7 +121,6 @@ impl App {
         }
         accounts.retain(|d| !d.as_os_str().is_empty());
         self.picker = Some(Picker { folders, accounts, account: 0, at: 0, folder: None, input: LineEdit::default() });
-        self.typing = false;
     }
 
     /// A key while the picker is open.
@@ -187,10 +180,9 @@ impl App {
         let Some(p) = self.picker.take() else { return Action::None };
         let (Some(cwd), Some(config_dir)) = (p.folder.clone(), p.accounts.get(p.account).cloned()) else { return Action::None };
         let prompt = p.input.text().trim().to_string();
-        let launch = Launch::New(prompt.clone());
+        let launch = Launch::New(prompt);
         self.note = match bridge::start(&self.claude, &config_dir, &cwd, &launch) {
             Ok(child) => {
-                let _ = history::add(&self.bridge, &cwd, &prompt); // recall is a convenience: a failure loses nothing
                 self.resuming = Some(Resuming { launch, child, cwd: cwd.clone(), config_dir });
                 format!("starting a session in {}…", tilde(&cwd))
             }

@@ -1,4 +1,4 @@
-//! The prompt panel's line being typed: its text and where the cursor is.
+//! The new-session picker's line being typed: its text and where the cursor is.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -11,9 +11,6 @@ pub struct LineEdit {
 impl LineEdit {
     pub fn text(&self) -> String {
         self.chars.iter().collect()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.chars.is_empty()
     }
     /// Replaces the text, the cursor at its end.
     pub fn set(&mut self, text: &str) {
@@ -94,17 +91,6 @@ impl LineEdit {
         i
     }
 
-    /// The text cut into rows of w chars, a line break shown as ↵, and the
-    /// row and column of the cursor.
-    pub fn rows(&self, w: usize) -> (Vec<String>, usize, usize) {
-        let w = w.max(1);
-        let mut rows: Vec<String> = self.chars.chunks(w).map(|c| c.iter().map(|&c| if c == '\n' { '↵' } else { c }).collect()).collect();
-        let (row, col) = (self.at / w, self.at % w);
-        if rows.len() <= row {
-            rows.push(String::new()); // the cursor after a full last row starts the next
-        }
-        (rows, row, col)
-    }
 }
 
 #[cfg(test)]
@@ -151,13 +137,4 @@ mod tests {
         assert!(!e.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
     }
 
-    #[test]
-    fn rows_wrap_the_text_and_place_the_cursor() {
-        assert_eq!(typed("abcdef").rows(4), (vec!["abcd".into(), "ef".into()], 1, 2));
-        assert_eq!(typed("abcd").rows(4), (vec!["abcd".into(), String::new()], 1, 0));
-        let mut e = typed("abcdef");
-        e.key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
-        assert_eq!(e.rows(4).1, 0);
-        assert_eq!(LineEdit::default().rows(4), (vec![String::new()], 0, 0));
-    }
 }
