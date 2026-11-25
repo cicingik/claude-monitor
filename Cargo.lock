@@ -979,6 +979,7 @@ name = "office"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "icy_sixel",
  "image",
  "libc",
  "portable-pty",

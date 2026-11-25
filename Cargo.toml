@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 base64 = "0.22"
+icy_sixel = "0.5"
 image = { version = "0.25", default-features = false, features = ["png", "gif"] }
 # localtime_r (localtime_s on Windows), so times print in local time.
 libc = "0.2"

@@ -1,4 +1,5 @@
-//! iTerm2 incremental painting: the cells that changed, as non-overlapping patches, sent as one frame.
+//! Incremental painting with iTerm2 images or sixels: the cells that changed,
+//! as non-overlapping patches, sent as one frame.
 
 use std::{
     collections::HashMap,
@@ -16,6 +17,8 @@ use ratatui::{
     buffer::{Buffer, CellDiffOption},
     layout::Rect,
 };
+
+use ratatui_image::picker::ProtocolType;
 
 use crate::{actors::Item, scene::Layout, terminal::Display};
 
@@ -248,7 +251,25 @@ fn paint_iterm2(out: &mut impl Write, img: &RgbaImage, l: &Layout, patch: CellRe
     out.write_all(d.wrap(seq).as_bytes())
 }
 
-/// Sends one iTerm2 frame of the office in a single write: the blanks, the
+/// Draws the cells `patch` of canvas img as one sixel at their top left. A
+/// sixel is opaque, so it covers what the cells showed with no erase first:
+/// an erase would show between it and the image. With `clear` the screen is
+/// cleared first, in the same write, as on a full repaint.
+fn paint_sixel(out: &mut impl Write, img: &RgbaImage, l: &Layout, patch: CellRect, d: &Display, clear: bool) -> io::Result<()> {
+    let p = CellRect { x1: patch.x1.min(l.area.width), y1: patch.y1.min(l.area.height), ..patch };
+    if p.is_empty() {
+        return Ok(());
+    }
+    let (fw, fh) = (u32::from(d.font.0), u32::from(d.font.1));
+    let (w, h) = (u32::from(p.x1 - p.x0) * fw, u32::from(p.y1 - p.y0) * fh);
+    let crop = image::imageops::crop_imm(img, u32::from(p.x0) * fw, u32::from(p.y0) * fh, w, h).to_image();
+    let sixel = icy_sixel::sixel_encode(crop.as_raw(), w as usize, h as usize, &icy_sixel::EncodeOptions::default()).map_err(|e| io::Error::other(e.to_string()))?;
+    let clear = if clear { "\x1b[2J" } else { "" };
+    let seq = format!("{clear}\x1b[{};{}H{sixel}", l.area.y + p.y0 + 1, l.area.x + p.x0 + 1);
+    out.write_all(d.wrap(seq).as_bytes())
+}
+
+/// Sends one frame of the office, iTerm2 images or sixels, in a single write: the blanks, the
 /// patches of img (with `clear`, a full repaint led by clearing the screen),
 /// then the card if it changed, between the begin and end of a synchronized
 /// update (DECSET 2026). One write is not enough on its own: the terminal
@@ -256,14 +277,17 @@ fn paint_iterm2(out: &mut impl Write, img: &RgbaImage, l: &Layout, patch: CellRe
 /// between two, with the cells erased for a patch before its image lands, a
 /// flicker that grows with every actor on the move.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn frame_iterm2(out: &mut impl Write, img: &RgbaImage, l: &Layout, patches: &[CellRect], blanks: &[CellRect], card: Option<&Buffer>, d: &Display, clear: bool) -> io::Result<()> {
+pub(crate) fn frame_patches(out: &mut impl Write, img: &RgbaImage, l: &Layout, patches: &[CellRect], blanks: &[CellRect], card: Option<&Buffer>, d: &Display, clear: bool) -> io::Result<()> {
     const BEGIN: &[u8] = b"\x1b[?2026h";
     let mut frame = BEGIN.to_vec();
     for &b in blanks {
         blank(&mut frame, b)?;
     }
     for &p in patches {
-        paint_iterm2(&mut frame, img, l, p, d, clear)?;
+        match d.protocol {
+            ProtocolType::Sixel => paint_sixel(&mut frame, img, l, p, d, clear)?,
+            _ => paint_iterm2(&mut frame, img, l, p, d, clear)?,
+        }
     }
     if let Some(c) = card {
         write_card(&mut CrosstermBackend::new(&mut frame), c)?;
@@ -483,7 +507,7 @@ mod tests {
         let (patches, blanks) = plan(changed(&was, &items, d.font), l.area, Some(Rect::new(0, 0, 3, 3)), Some(card.area));
         assert!(patches.len() >= 3 && !blanks.is_empty(), "{} patches, {} blanks", patches.len(), blanks.len());
         let mut out = Calls::default();
-        frame_iterm2(&mut out, &img, &l, &patches, &blanks, Some(&card), &d, false).unwrap();
+        frame_patches(&mut out, &img, &l, &patches, &blanks, Some(&card), &d, false).unwrap();
         assert_eq!((out.writes, out.flushes), (1, 1));
         let s = String::from_utf8_lossy(&out.bytes);
         assert_eq!(s.matches("\x1b]1337;File=").count(), patches.len());
@@ -494,14 +518,43 @@ mod tests {
 
         // A full repaint: the clear leads the same single write.
         let mut out = Calls::default();
-        frame_iterm2(&mut out, &img, &l, &[CellRect::all(l.area)], &[], None, &d, true).unwrap();
+        frame_patches(&mut out, &img, &l, &[CellRect::all(l.area)], &[], None, &d, true).unwrap();
         assert_eq!((out.writes, out.flushes), (1, 1));
         assert!(out.bytes.starts_with(b"\x1b[?2026h\x1b[2J") && out.bytes.ends_with(b"\x1b[?2026l"));
 
         // Nothing changed: nothing sent.
         let mut out = Calls::default();
-        frame_iterm2(&mut out, &img, &l, &[], &[], None, &d, false).unwrap();
+        frame_patches(&mut out, &img, &l, &[], &[], None, &d, false).unwrap();
         assert_eq!((out.writes, out.flushes), (0, 0));
+    }
+
+    /// With sixels, a frame is the changed cells as one sixel each at their
+    /// top left, no cell erased first (the erase would show), in one
+    /// synchronized write, and far smaller than the whole picture.
+    #[test]
+    fn a_sixel_frame_paints_only_the_changed_cells_over_the_old() {
+        let (mut app, mut cast, office) = busy();
+        let d = Display { protocol: ProtocolType::Sixel, font: (10, 20), tmux: false, kitty_id: 1 };
+        let l = scene::fit((1254, 1254), 140, 40, d.font, false);
+        app.refresh_scene(NOW, 0.0, &mut cast);
+        let stage = Stage::new(&office, l, &cast);
+        let (_, was) = stage.compose((1254, 1254), &app, &cast, Duration::ZERO);
+        let t = TICK * 3;
+        app.refresh_scene(NOW, t.as_secs_f64(), &mut cast);
+        let (img, items) = stage.compose((1254, 1254), &app, &cast, t);
+        let (patches, _) = plan(changed(&was, &items, d.font), l.area, None, None);
+        assert!(!patches.is_empty());
+        let mut out = Calls::default();
+        frame_patches(&mut out, &img, &l, &patches, &[], None, &d, false).unwrap();
+        assert_eq!((out.writes, out.flushes), (1, 1));
+        let s = String::from_utf8_lossy(&out.bytes);
+        assert!(s.starts_with("\x1b[?2026h") && s.ends_with("\x1b[?2026l"), "a frame is one synchronized update");
+        assert_eq!(s.matches("\x1bP").count(), patches.len(), "one sixel a patch");
+        assert!(!s.contains("X\x1b") && !s.contains("\x1b[2J") && !s.contains("1337"), "no erase, no clear, no iTerm2 image");
+        let mut whole = Calls::default();
+        frame_patches(&mut whole, &img, &l, &[CellRect::all(l.area)], &[], None, &d, true).unwrap();
+        assert!(whole.bytes.starts_with(b"\x1b[?2026h\x1b[2J"), "a full repaint clears first, in the same update");
+        assert!(out.bytes.len() * 4 < whole.bytes.len(), "a patch frame {} bytes, the whole picture {}", out.bytes.len(), whole.bytes.len());
     }
 
     /// Pieces counts the images with a piece on the screen: patches add

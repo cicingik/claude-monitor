@@ -99,7 +99,7 @@ use ratatui_image::{Image, picker::ProtocolType, protocol::Protocol};
 use actors::{Item, Scene};
 use cast::Cast;
 use cli::{Args, parse_args};
-use patch::{CellRect, MAX_PIECES, Pieces, WHOLE_EVERY, changed, frame_iterm2, plan, write_card};
+use patch::{CellRect, MAX_PIECES, Pieces, WHOLE_EVERY, changed, frame_patches, plan, write_card};
 use scan::{Scanner, Snapshot, unix_nanos};
 use scene::{Layout, Scaled, Sprite};
 use terminal::{Counted, Display, restore};
@@ -202,7 +202,8 @@ fn show(out: &mut Counted, office: &RgbaImage, cast: &mut Cast, d: &Display, app
             // The office in iTerm2 goes straight to the terminal, never
             // through ratatui, whose clear asks where the cursor is (CSI 6n)
             // and whose text the picture has none of.
-            let iterm2 = app.view == View::Office && d.protocol == ProtocolType::Iterm2;
+            // iTerm2 and sixel paint only the cells that changed (see patch).
+            let iterm2 = app.view == View::Office && matches!(d.protocol, ProtocolType::Iterm2 | ProtocolType::Sixel);
             if full {
                 (shown, encoded, anchor, on_screen) = (None, None, None, None);
                 if !iterm2 {
@@ -239,7 +240,7 @@ fn show(out: &mut Counted, office: &RgbaImage, cast: &mut Cast, d: &Display, app
                         None => (vec![CellRect::all(l.area)], Vec::new()),
                     };
                     let fresh_card = card.as_ref().filter(|&c| on_screen.as_ref() != Some(c));
-                    frame_iterm2(term.backend_mut(), &img, &l, &patches, &blanks, fresh_card, d, shown.is_none())?;
+                    frame_patches(term.backend_mut(), &img, &l, &patches, &blanks, fresh_card, d, shown.is_none())?;
                     if shown.is_none() {
                         pieces = Pieces::new(l.area);
                     }
@@ -247,7 +248,8 @@ fn show(out: &mut Counted, office: &RgbaImage, cast: &mut Cast, d: &Display, app
                         whole = now;
                     }
                     patches.iter().for_each(|&p| pieces.paint(p));
-                    collapse = pieces.live() > MAX_PIECES && now - whole >= WHOLE_EVERY;
+                    // A sixel paints over the cells' pixels: there are no pieces to collapse.
+                    collapse = d.protocol == ProtocolType::Iterm2 && pieces.live() > MAX_PIECES && now - whole >= WHOLE_EVERY;
                 } else {
                     let key = picture_key(&items);
                     let fresh = encoded.as_ref().is_none_or(|(_, k)| *k != key);
@@ -317,7 +319,7 @@ fn show(out: &mut Counted, office: &RgbaImage, cast: &mut Cast, d: &Display, app
                             let seq = d.wrap(format!("\x1b_Ga=d,d=I,i={}\x1b\\", d.kitty_id));
                             term.backend_mut().write_all(seq.as_bytes())?;
                         }
-                        if app.view == View::Office && d.protocol == ProtocolType::Iterm2 {
+                        if app.view == View::Office && matches!(d.protocol, ProtocolType::Iterm2 | ProtocolType::Sixel) {
                             // The tree's draws hid the cursor; the old office never did.
                             term.show_cursor()?;
                         }
