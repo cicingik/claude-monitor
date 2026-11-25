@@ -1,10 +1,10 @@
 """Paints assets/forest.png: the office as a forest camp, 1254x1254 like
 assets/office.png, every room, door, seat and desk where the walk graph in
-src/actors.rs expects it. Trails follow the graph's corridors.
+assets/office.json expects it. Trails follow the graph's corridors.
 
     python3 tools/forest_map.py [OUT.png]      # needs Pillow and numpy
 
-Coordinates are office.png pixels, as in src/actors.rs; the picture is drawn
+Coordinates are office.png pixels, as in assets/office.json; the picture is drawn
 at S times the size and scaled down, for smooth edges.
 """
 

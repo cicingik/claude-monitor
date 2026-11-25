@@ -136,8 +136,8 @@ struct Stage {
 
 impl Stage {
     fn new(office: &RgbaImage, layout: Layout, cast: &Cast) -> Stage {
-        let scaled = (0..cast.len()).map(|i| cast.sprite(i).scaled(&layout, scene::CHARACTER_HEIGHT)).collect();
-        let pet = cast.pet.as_ref().map(|p| p.scaled(&layout, scene::PET_HEIGHT / p.typical_height()));
+        let scaled = (0..cast.len()).map(|i| cast.sprite(i).scaled(&layout, actors::graph().character_height)).collect();
+        let pet = cast.pet.as_ref().map(|p| p.scaled(&layout, scene::PET_SHARE * actors::graph().character_height / p.typical_height()));
         Stage { base: scene::base(office, &layout), layout, scaled, pet }
     }
 
@@ -436,15 +436,78 @@ fn home() -> PathBuf {
     env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default()
 }
 
-/// The sprites, from --sprites or $XDG_CONFIG_HOME/claude-monitor/sprites
-/// (else ~/.config/claude-monitor/sprites), with the built-in character for
-/// the rest, and the built-in pet.
+/// $XDG_CONFIG_HOME/claude-monitor (else ~/.config/claude-monitor).
+fn config_dir() -> PathBuf {
+    let base = env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()).map_or_else(|| home().join(".config"), PathBuf::from);
+    base.join("claude-monitor")
+}
+
+/// The office picture and its walk graph: DIR/office.png from --office DIR,
+/// else from <config_dir>/office when that holds one, else the built-in
+/// office. A picture with no DIR/office.json beside it keeps the built-in
+/// layout, as a repaint of the built-in office does.
+fn load_office(args: &Args) -> Result<RgbaImage, String> {
+    let dir = args.office.clone().unwrap_or_else(|| config_dir().join("office"));
+    let png = dir.join("office.png");
+    if args.office.is_none() && !png.exists() {
+        return image::load_from_memory(OFFICE_PNG).map(|i| i.to_rgba8()).map_err(|e| format!("office.png: {e}"));
+    }
+    let office = image::open(&png).map_err(|e| format!("{}: {e}", png.display()))?.to_rgba8();
+    let json = dir.join("office.json");
+    match std::fs::read_to_string(&json) {
+        Ok(text) => actors::use_graph(actors::layout::parse(&text).and_then(|l| actors::Graph::from_layout(&l)).map_err(|e| format!("{}: {e}", json.display()))?),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}", json.display())),
+    }
+    Ok(office)
+}
+
+/// `office layout DIR`: checks DIR/office.json against DIR/office.png and
+/// draws its walk graph over the picture, to DIR/office-preview.png.
+/// `office layout init DIR`: a new DIR holding the built-in office's picture
+/// and layout, to start one's own from.
+fn layout_command(argv: &[String]) -> Result<String, String> {
+    const USE: &str = "usage: office layout DIR        check DIR/office.json, draw it over DIR/office.png to DIR/office-preview.png\n       office layout init DIR   start DIR from the built-in office.png and office.json";
+    match argv {
+        [init, dir] if init == "init" => {
+            let dir = Path::new(dir);
+            if dir.join("office.png").exists() || dir.join("office.json").exists() {
+                return Err(format!("{} already holds an office: nothing written", dir.display()));
+            }
+            std::fs::create_dir_all(dir).and_then(|_| std::fs::write(dir.join("office.png"), OFFICE_PNG)).and_then(|_| std::fs::write(dir.join("office.json"), actors::layout::BUILT_IN)).map_err(|e| format!("{}: {e}", dir.display()))?;
+            Ok(format!("wrote {0}/office.png and {0}/office.json: edit them, then office layout {0}", dir.display()))
+        }
+        [dir] if !dir.starts_with('-') => {
+            let dir = Path::new(dir);
+            let (png, json) = (dir.join("office.png"), dir.join("office.json"));
+            let mut img = image::open(&png).map_err(|e| format!("{}: {e}", png.display()))?.to_rgba8();
+            let text = std::fs::read_to_string(&json).map_err(|e| format!("{}: {e}", json.display()))?;
+            let g = actors::layout::parse(&text).and_then(|l| actors::Graph::from_layout(&l)).map_err(|e| format!("{}: {e}", json.display()))?;
+            actors::layout::preview(&mut img, &g);
+            let out = dir.join("office-preview.png");
+            img.save(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+            Ok(format!(
+                "{}: usable: {} nodes, {} corridors, {} desks and the lead's, {} meeting chairs, {} rest seats, {} visitor stops, {} pet stops\npreview: {}",
+                json.display(),
+                g.nodes.len(),
+                g.corridors(),
+                g.desks.len(),
+                g.chairs.len(),
+                g.seats.len(),
+                g.stops.len(),
+                g.pet_stops.len(),
+                out.display()
+            ))
+        }
+        _ => Err(USE.into()),
+    }
+}
+
+/// The sprites, from --sprites or <config_dir>/sprites, with the built-in
+/// character for the rest, and the built-in pet.
 fn load_cast(args: &Args) -> Result<Cast, String> {
     let fallback = Some(Sprite::decode(CHARACTER_GIF).map_err(|e| format!("character: {e}"))?);
-    let dir = args.sprites.clone().unwrap_or_else(|| {
-        let base = env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()).map_or_else(|| home().join(".config"), PathBuf::from);
-        base.join("claude-monitor").join("sprites")
-    });
+    let dir = args.sprites.clone().unwrap_or_else(|| config_dir().join("sprites"));
     let mut cast = Cast::load(&dir, args.sprites.is_some(), fallback);
     cast.pet = Some(Sprite::decode(PET_GIF).map_err(|e| format!("pet: {e}"))?);
     Ok(cast)
@@ -470,7 +533,7 @@ fn dump(args: &Args) -> Result<String, Box<dyn Error>> {
 /// size, laid out at the time of the scan and walked on (one TICK a step)
 /// until a visitor has been in for 2 s, or for at most 30 s.
 fn snapshot(args: &Args, out: &Path) -> Result<String, Box<dyn Error>> {
-    let office = image::load_from_memory(OFFICE_PNG)?.to_rgba8();
+    let office = load_office(args)?;
     let mut cast = load_cast(args)?;
     let mut snap = Scanner::new(roots(args), args.since).scan(now());
     bridge::overlay(&mut snap, &bridge::dir());
@@ -543,7 +606,7 @@ fn run(args: Args) -> Result<String, Box<dyn Error>> {
     if let Some(out) = &args.snapshot {
         return snapshot(&args, out);
     }
-    let office = image::load_from_memory(OFFICE_PNG)?.to_rgba8();
+    let office = load_office(&args)?;
     let mut cast = load_cast(&args)?;
     let mut app = App::new(args.since, now() as u64);
     // Only here, never for --dump or --snapshot; nothing is fetched until the Usage tab shows.
@@ -590,6 +653,16 @@ fn main() {
     let argv: Vec<String> = env::args().skip(1).collect();
     if argv.first().map(String::as_str) == Some("hook") {
         process::exit(hook_command(argv.get(1).map_or("", String::as_str)));
+    }
+    if argv.first().map(String::as_str) == Some("layout") {
+        match layout_command(&argv[1..]) {
+            Ok(said) => println!("{said}"),
+            Err(e) => {
+                eprintln!("office layout: {e}");
+                process::exit(1);
+            }
+        }
+        return;
     }
     let args = match parse_args(argv.into_iter()) {
         Ok(a) => a,

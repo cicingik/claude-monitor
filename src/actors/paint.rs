@@ -12,7 +12,7 @@ use super::{Actor, Anim, Scene};
 use crate::{
     cast::fnv32a,
     scan::{EdgeKind, Status},
-    scene::{self, CHARACTER_HEIGHT, Layout, Pose, Scaled},
+    scene::{self, Layout, Pose, Scaled},
 };
 
 /// The colors of the edge kinds: yellow spawn, cyan message, green handback.
@@ -79,7 +79,7 @@ pub fn paint(canvas: &mut RgbaImage, l: &Layout, office: (u32, u32), sc: &Scene,
         let dim = a.status == Status::Done && a.anim != Anim::Walk && !a.visitor;
         let img = if dim { &sprite.dimmed } else { &sprite.frames[frame.min(sprite.frames.len() - 1)] };
         let mut p = a.pos;
-        p.y -= lift * CHARACTER_HEIGHT;
+        p.y -= lift * super::graph().character_height;
         let ps = Pose { p, left: a.left, moving: a.anim == Anim::Walk };
         let rect = scene::draw_character(canvas, l, office, img, ps, sec);
         let bob = if ps.moving { (scene::walk_bob(sec) * f64::from(img.height())).round() as i64 } else { 0 };

@@ -11,10 +11,12 @@ use image::{
 };
 use ratatui::layout::Rect;
 
-pub const CHARACTER_HEIGHT: f64 = 0.07; // of the office height
+/// A character's height in a layout that names none, as a share of the office's height.
+pub const CHARACTER_HEIGHT: f64 = 0.07;
 /// How tall the pet usually looks: its typical frame, not the box around
 /// all of them (see Sprite::typical_height).
-pub const PET_HEIGHT: f64 = 0.6 * CHARACTER_HEIGHT;
+/// The pet's height, as a share of a character's.
+pub const PET_SHARE: f64 = 0.6;
 /// Widest a character may be, for its height: sprites wider than this are
 /// narrowed, so places CHARACTER_HEIGHT·MAX_ASPECT apart never overlap.
 pub const MAX_ASPECT: f64 = 0.9;
@@ -62,7 +64,7 @@ impl Layout {
 
     /// A character's height in canvas pixels.
     pub fn character_height(&self) -> u32 {
-        self.height(CHARACTER_HEIGHT)
+        self.height(crate::actors::graph().character_height)
     }
 
     /// Canvas pixels of h, a fraction of the office height.

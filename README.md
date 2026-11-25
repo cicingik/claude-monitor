@@ -207,8 +207,9 @@ macOS binaries are not signed.
 ./target/release/office --snapshot room.png   # render the room to a PNG, exit
 ```
 
-`assets/office.png` (the room), `assets/character.gif` (the default character)
-and `assets/pet.gif` (the pet) are built into the binary at compile time.
+`assets/office.png` (the room) with its layout `assets/office.json`,
+`assets/character.gif` (the default character) and `assets/pet.gif` (the pet)
+are built into the binary at compile time, so it needs no files to run.
 
 On Windows WezTerm from WSL, start it in a WezTerm window of its own:
 
@@ -317,6 +318,52 @@ never stops the monitor.
 
 These files stay on your machine. Keep them in the sprites directory, not in
 this repository: `sprites/` is in `.gitignore`.
+
+## Custom office
+
+office draws the built-in room with no setup. To use your own, put an
+`office.png` in `~/.config/claude-monitor/office/`, or pass `--office DIR`.
+Beside it, `office.json` says where everything is. Without one, the built-in
+layout is used, which suits a repaint of the built-in room
+(`assets/forest.png` is one: try `--office` on a folder holding it as
+`office.png`).
+
+office never looks at the picture's pixels to find its way. The layout is a
+walk graph: named points (nodes) in the picture's pixels, and corridors
+between them. Characters walk only along corridors, so a door is just a node
+in the doorway with a corridor through it. Some nodes have a role:
+
+| Key | What it is |
+|-----|------------|
+| `size` | `[width, height]`: the pixels the coordinates are in (the picture is scaled to it) |
+| `character_height` | a character's height as a share of the picture's (optional, default `0.07`) |
+| `nodes` | `[name, x, y]` each |
+| `corridors` | `[name, name]` each, walkable both ways |
+| `exit` | where agents walk in and out |
+| `lead_desk` | the desk of the most recently active lead |
+| `desks` | the other work places, filled in this order |
+| `chairs` | more work places, once the desks are taken (the meeting room) |
+| `rest` | rest rooms, each a list of its seats: idle agents take a seat of each room in turn |
+| `pet_stops` | where the pet strolls |
+
+Visitors wait at any other node that keeps a character's width clear of every
+place.
+
+The quickest start is the built-in room itself:
+
+```sh
+office layout init ~/.config/claude-monitor/office   # its office.png and office.json
+office layout ~/.config/claude-monitor/office        # check it, draw office-preview.png
+```
+
+Edit the picture and the json, then run `office layout DIR` again. It names
+the first mistake it finds (a corridor or role naming no node, a node off
+the picture or named twice, no desk, a place no corridor reaches from the
+exit). When it is usable, it draws the graph over your picture into
+`DIR/office-preview.png`: corridors red, desks blue, meeting chairs cyan,
+rest seats green (ticked by the order they fill), visitor stops magenta, the
+exit yellow and the pet's stops in orange rings. office itself refuses to
+start on a layout `office layout` rejects, and says why.
 
 ## Art and licensing
 
@@ -525,19 +572,13 @@ mind who sees your screen while the panel is open.
 cargo build --release && cargo test && cargo clippy -- -D warnings
 ```
 
-Some tests read `assets/office.png`.
-
-To see the walk graph (corridors, places, the visitors' and the pet's stops)
-drawn over the room:
-
-```sh
-OFFICE_GRAPH_PNG=/tmp/g.png cargo test graph_picture -- --ignored
-OFFICE_GRAPH_PNG=/tmp/g.png OFFICE_GRAPH_BASE=assets/forest.png cargo test graph_picture -- --ignored
-```
+Some tests read `assets/office.png` and check the built-in layout,
+`assets/office.json`, against its walls. `office layout DIR` draws a layout
+over its picture (see [Custom office](#custom-office)).
 
 `assets/forest.png` is the same room painted as a forest camp, every place
-where the graph expects it. `python3 tools/forest_map.py [OUT.png]` repaints it
-(needs Pillow and numpy).
+where `assets/office.json` expects it. `python3 tools/forest_map.py [OUT.png]`
+repaints it (needs Pillow and numpy).
 
 ### Code map
 
@@ -549,7 +590,7 @@ where the graph expects it. `python3 tools/forest_map.py [OUT.png]` repaints it
 | `src/patch.rs` | iTerm2 incremental painting: only the cells that changed |
 | `src/scene.rs` | where the room sits in the pane, and the character sprites |
 | `src/cast.rs` | custom characters from the sprites directory |
-| `src/actors.rs` | who sits where; `actors/graph.rs` the corridors, `actors/walk.rs` movement, `actors/paint.rs` drawing |
+| `src/actors.rs` | who sits where; `actors/layout.rs` layout files, `actors/graph.rs` the walk graph, `actors/walk.rs` movement, `actors/paint.rs` drawing |
 | `src/scan.rs` | the scan of every projects directory; `scan/transcript.rs` one transcript, `scan/text.rs` text and time helpers |
 | `src/ui.rs` | app state and keys; `ui/draw.rs` the tree view, `ui/panel.rs` the session panel, `ui/card.rs` the office card, `ui/select.rs` mouse selection |
 | `src/bridge.rs` | the permission hook, who holds a session, and starting `claude` |

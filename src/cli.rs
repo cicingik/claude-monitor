@@ -13,7 +13,10 @@ const USAGE: &str = "usage: office [flags]
   --since DUR  only sessions whose transcript changed within DUR (default 24h, 0 = all)
   --sprites DIR  character .gif/.png files named after agent types, or any name
                (default $XDG_CONFIG_HOME/claude-monitor/sprites, else ~/.config/claude-monitor/sprites)
-  --dump       scan once, print the tree, edges and usage as text, exit
+  --office DIR  the office picture DIR/office.png, with its layout DIR/office.json
+               (without one, the built-in layout); default claude-monitor/office in
+               the same config directory when it holds an office.png, else the built-in office
+  --dump      scan once, print the tree, edges and usage as text, exit
   --snapshot OUT.png  scan once, render the office at full size to OUT.png as it stands
                once a visitor has walked in (at most 30 s on), exit
   --offline    never fetch the accounts' 5 h and 7 day limits (tree, Usage tab)
@@ -45,6 +48,7 @@ pub(crate) struct Args {
     pub(crate) roots: Vec<PathBuf>,      // empty: ~/.claude/projects and every ~/.claude-*/projects
     pub(crate) since: i64,               // nanoseconds, 0 = all
     pub(crate) sprites: Option<PathBuf>, // None: the default directory
+    pub(crate) office: Option<PathBuf>,  // None: the default directory if it holds a picture, else built in
     pub(crate) dump: bool,
     pub(crate) snapshot: Option<PathBuf>,
     pub(crate) offline: bool, // no requests for the accounts' limits
@@ -57,6 +61,7 @@ pub(crate) fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args, S
         roots: Vec::new(),
         since: 24 * 3600 * scan::SEC,
         sprites: None,
+        office: None,
         dump: false,
         snapshot: None,
         offline: false,
@@ -87,6 +92,7 @@ pub(crate) fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args, S
             "--root" => args.roots.push(value()?.into()),
             "--since" => args.since = format::parse_duration(&value()?)?,
             "--sprites" => args.sprites = Some(value()?.into()),
+            "--office" => args.office = Some(value()?.into()),
             "--dump" => args.dump = true,
             "--snapshot" => args.snapshot = Some(value()?.into()),
             "--offline" => args.offline = true,

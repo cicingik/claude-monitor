@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use super::{Actor, Anim, GRAPH, MAX_VISITORS, PET, PET_SPEED, PET_WAIT, Scene, VISIT_EVERY, VISIT_WAIT, VISITOR_SPEED, graph::apart};
+use super::{Actor, Anim, graph, MAX_VISITORS, PET, PET_SPEED, PET_WAIT, Scene, VISIT_EVERY, VISIT_WAIT, VISITOR_SPEED};
 use crate::{
     scan::Status,
     scene::{Point, Pose, WALK_SPEED},
@@ -28,7 +28,7 @@ impl Mover {
     /// Heads for dest from where it is: on to the next node or back to the
     /// last, whichever is shorter, then along the corridors.
     fn head_for(&mut self, dest: usize) {
-        let g = &*GRAPH;
+        let g = graph();
         let d = |n: usize| (g.nodes[n].x - self.pos.x).hypot(g.nodes[n].y - self.pos.y);
         let via = |n: usize| {
             let (p, len) = g.path(n, dest);
@@ -46,7 +46,7 @@ impl Mover {
     }
 
     fn advance(&mut self, mut step: f64) {
-        let g = &*GRAPH;
+        let g = graph();
         while step > 0.0 {
             let Some(&n) = self.path.front() else { return };
             let q = g.nodes[n];
@@ -80,7 +80,7 @@ struct Visit {
 impl Visit {
     /// In at the entrance, round 2 to 4 stops, and back out.
     fn new(actor: Actor, rng: &mut Rng) -> Visit {
-        let g = &*GRAPH;
+        let g = graph();
         let mut stops = VecDeque::new();
         let mut at = g.exit;
         for _ in 0..2 + rng.below(3) {
@@ -146,7 +146,7 @@ impl Rng {
 }
 
 /// The office pet: a visitor that never leaves the lobby. It walks from one
-/// of GRAPH.pet_stops to another, waiting PET_WAIT at each, for good: its
+/// of graph().pet_stops to another, waiting PET_WAIT at each, for good: its
 /// round is topped up whenever it runs short.
 #[derive(Clone, Debug)]
 struct Pet {
@@ -157,7 +157,7 @@ struct Pet {
 impl Pet {
     /// Waiting at one of its stops, picked by seed.
     fn new(seed: u64) -> Pet {
-        let g = &*GRAPH;
+        let g = graph();
         let mut rng = Rng::new(seed);
         let at = g.pet_stops[rng.below(g.pet_stops.len())];
         let pos = g.nodes[at];
@@ -170,9 +170,9 @@ impl Pet {
     /// Walks or waits dt seconds; where it stands then. Waiting where one of
     /// `others` stands, it walks on instead.
     fn walk(&mut self, dt: f64, mut others: impl Iterator<Item = Point>) -> Pose {
-        let g = &*GRAPH;
+        let g = graph();
         if let (true, Some(&(_, wait))) = (self.v.m.path.is_empty(), self.v.stops.front())
-            && others.any(|p| !apart(p, self.v.m.pos))
+            && others.any(|p| !graph().apart(p, self.v.m.pos))
         {
             self.v.waited = self.v.waited.max(wait);
         }
@@ -220,7 +220,7 @@ impl Walker {
     /// sc: actors on their way are drawn where they are, walking, the
     /// visitors join the actors and the roster, and the pet is where it is.
     pub fn step(&mut self, sc: &mut Scene, sec: f64) {
-        let g = &*GRAPH;
+        let g = graph();
         let dt = self.last.map_or(0.0, |l| (sec - l).clamp(0.0, 0.25));
         self.last = Some(sec);
         let step = WALK_SPEED * dt;
