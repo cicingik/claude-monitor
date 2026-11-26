@@ -161,6 +161,7 @@ pub struct Agent {
     pub events: Vec<Event>,    // newest last, at most MAX_EVENTS
     pub children: Vec<String>, // ids, oldest first
     pub live: bool,            // a session a running Claude Code process holds, quiet for at most IDLE_LIMIT
+    pub held: crate::bridge::Holder, // how, while live: in the background (p opens it) or in a terminal of its own
     pub continued: bool,       // its conversation moved on to another session id: nothing listens here
 }
 
@@ -286,10 +287,10 @@ impl Scanner {
     pub fn scan(&mut self, now: i64) -> Snapshot {
         let mut snap = Snapshot { scanned_at: now, ..Snapshot::default() };
         let mut seen = HashSet::new();
-        let mut live: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+        let mut live: HashMap<PathBuf, HashMap<String, crate::bridge::Holder>> = HashMap::new();
         for root in self.roots.clone() {
             let config_dir = root.dir.parent().map(Path::to_path_buf).unwrap_or_default();
-            let held = live.entry(config_dir.clone()).or_insert_with(|| crate::bridge::live_ids(&config_dir)).clone();
+            let held = live.entry(config_dir.clone()).or_insert_with(|| crate::bridge::live(&config_dir)).clone();
             for p in sorted_dir(&root.dir) {
                 if !p.file_type().is_ok_and(|t| t.is_dir()) {
                     continue;
@@ -303,7 +304,7 @@ impl Scanner {
                     }
                     let Ok(md) = e.metadata() else { continue };
                     let sid = name.trim_end_matches(".jsonl");
-                    if self.since > 0 && now - mtime(&md) > self.since && !(held.contains(sid) && now - mtime(&md) <= IDLE_LIMIT) {
+                    if self.since > 0 && now - mtime(&md) > self.since && !(held.contains_key(sid) && now - mtime(&md) <= IDLE_LIMIT) {
                         continue;
                     }
                     self.session(&mut snap, &mut seen, &root, &proj_dir, &proj_name, sid, &md, now);
@@ -313,8 +314,9 @@ impl Scanner {
         self.files.retain(|p, _| seen.contains(p));
         for id in &snap.roots {
             let a = snap.by_id.get_mut(id).expect("a root is an agent");
-            let held = live.get(&a.config_dir).is_some_and(|held| held.contains(id.split('@').next().unwrap_or(id)));
-            a.live = !a.continued && held && now - a.last_activity <= IDLE_LIMIT;
+            let held = live.get(&a.config_dir).and_then(|held| held.get(id.split('@').next().unwrap_or(id))).cloned().unwrap_or_default();
+            a.live = !a.continued && held != crate::bridge::Holder::None && now - a.last_activity <= IDLE_LIMIT;
+            a.held = if a.live { held } else { crate::bridge::Holder::None };
         }
         let by_id = &snap.by_id;
         snap.roots.sort_by(|a, b| by_id[b].last_activity.cmp(&by_id[a].last_activity));

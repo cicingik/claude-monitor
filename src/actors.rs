@@ -218,6 +218,7 @@ mod tests {
             events: Vec::new(),
             children: Vec::new(),
             live: false,
+            held: Default::default(),
             continued: false,
         }
     }

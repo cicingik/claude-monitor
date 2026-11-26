@@ -11,6 +11,7 @@ use ratatui::{
 };
 
 use crate::{
+    bridge::Holder,
     format::{age, agent_type, clock, fit, hour_minute, human_tokens, label, local, short_duration, short_id, short_model, usage_detail},
     limits::{AccountUsage, Limit},
     scan::{Agent, EdgeKind, Kind, Snapshot, Status, Usage, days_from_civil, truncate},
@@ -137,7 +138,13 @@ impl App {
                 };
                 let prefix = format!("{}{caret} ", "  ".repeat(depth));
                 // Model and tokens are in the detail tabs; a row names the agent and its age.
-                let mut cols = format!(" {:>4}", age(now, a.last_activity));
+                // How a running session is held: bg opens in the panel with p, tty runs in a terminal of its own.
+                let held = match a.held {
+                    Holder::Background { .. } => " bg ",
+                    Holder::Terminal => " tty",
+                    Holder::None => "",
+                };
+                let mut cols = format!("{held} {:>4}", age(now, a.last_activity));
                 if w >= 60 && a.kind == Kind::Subagent {
                     cols = format!(" {}{cols}", fit(agent_type(a), 15));
                 }

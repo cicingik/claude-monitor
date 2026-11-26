@@ -93,6 +93,9 @@ pub struct App {
     selection: Option<select::Selection>, // text dragged over in the tree view
     panes: Cell<[Rect; 3]>, // the insides of the tree, prompt and detail panes, as last drawn
     pub copied: Option<String>, // selected text for main to put on the clipboard
+    pub alerts: Vec<String>,    // an agent started waiting on you: for main to ring and notify
+    pub quiet: bool,            // --quiet: no alerts
+    waiting: Option<HashSet<String>>, // the agents waiting at the last scan; None before the first
     here_for: Option<Here>, // the session whose background resume needs a terminal: o runs it here
     picker: Option<new::Picker>, // the new-session picker over the tree, while open
     select_started: Option<String>, // a session office started: selected once a scan shows it
@@ -183,6 +186,9 @@ impl App {
             selection: None,
             panes: Cell::new([Rect::default(); 3]),
             copied: None,
+            alerts: Vec::new(),
+            quiet: false,
+            waiting: None,
             here_for: None,
             picker: None,
             select_started: None,
@@ -200,6 +206,15 @@ impl App {
     }
 
     pub fn set_snapshot(&mut self, snap: Snapshot) {
+        // An alert for each agent that started waiting since the last scan;
+        // none for those already waiting when office starts.
+        let mut waiting: Vec<&Agent> = snap.by_id.values().filter(|a| a.status == Status::Waiting).collect();
+        waiting.sort_by(|a, b| a.id.cmp(&b.id));
+        if let Some(was) = self.waiting.as_ref().filter(|_| !self.quiet) {
+            let new = waiting.iter().filter(|a| !was.contains(&a.id));
+            self.alerts.extend(new.map(|a| format!("{} waits on you: {}", crate::format::label(a), a.last_tool)));
+        }
+        self.waiting = Some(waiting.iter().map(|a| a.id.clone()).collect());
         let started = self.select_started.as_ref().and_then(|short| snap.roots.iter().find(|id| id.starts_with(short.as_str())).cloned());
         self.snap = Some(snap);
         if let Some(id) = started {
@@ -477,6 +492,7 @@ mod tests {
             events: Vec::new(),
             children: Vec::new(),
             live: false,
+            held: Default::default(),
             continued: false,
         }
     }
@@ -838,6 +854,59 @@ mod tests {
         let t = app.panel_lines(40, 20).iter().map(Line::to_string).collect::<Vec<_>>();
         let at = t.iter().position(|l| l.starts_with("not resumed:")).expect("the note");
         assert!(t[at..].join(" ").ends_with("cd ~/dev/api && claude") && !t[at..].join(" ").contains('…'), "{t:#?}");
+    }
+
+    /// A running session's row says how it runs: bg (p opens it in the
+    /// panel) or tty (in a terminal of its own); a stopped one says neither.
+    #[test]
+    fn a_running_sessions_row_says_whether_p_opens_it_here() {
+        let mut snap = busy_snap();
+        let s1 = snap.by_id.get_mut("s1").unwrap();
+        (s1.title, s1.live, s1.held) = ("In the background".into(), true, bridge::Holder::Background { job: "j".into() });
+        let mut app = App::new(0, 1);
+        app.set_snapshot(snap.clone());
+        let row = |app: &App, title: &str| app.tree_lines(80).iter().map(Line::to_string).find(|r| r.contains(title)).unwrap();
+        assert!(row(&app, "In the background").contains(" bg "), "{}", row(&app, "In the background"));
+        let s1 = snap.by_id.get_mut("s1").unwrap();
+        (s1.title, s1.held) = ("In a terminal".into(), bridge::Holder::Terminal);
+        app.set_snapshot(snap.clone());
+        assert!(row(&app, "In a terminal").contains(" tty "), "{}", row(&app, "In a terminal"));
+        let s1 = snap.by_id.get_mut("s1").unwrap();
+        (s1.title, s1.live, s1.held) = ("Not running".into(), false, bridge::Holder::None);
+        app.set_snapshot(snap);
+        let r = row(&app, "Not running");
+        assert!(!r.contains(" bg ") && !r.contains(" tty "), "{r}");
+    }
+
+    /// An agent that starts waiting on you raises one alert, naming it and
+    /// what it waits on; one already waiting when office starts raises none,
+    /// nor does one still waiting at the next scan; --quiet raises none.
+    #[test]
+    fn an_agent_that_starts_waiting_raises_one_alert() {
+        let waiting = |snap: &mut Snapshot, id: &str, tool: &str| {
+            let a = snap.by_id.get_mut(id).unwrap();
+            (a.status, a.last_tool) = (Status::Waiting, tool.into());
+        };
+        let mut snap = busy_snap();
+        waiting(&mut snap, "s1", "AskUserQuestion");
+        let mut app = App::new(0, 1);
+        app.set_snapshot(snap.clone());
+        assert!(app.alerts.is_empty(), "already waiting at start: {:?}", app.alerts);
+        waiting(&mut snap, "a1", "Bash: rm -rf build");
+        app.set_snapshot(snap.clone());
+        assert_eq!(app.alerts.len(), 1, "{:?}", app.alerts);
+        assert!(app.alerts[0].ends_with("waits on you: Bash: rm -rf build"), "{:?}", app.alerts);
+        app.alerts.clear();
+        app.set_snapshot(snap.clone());
+        assert!(app.alerts.is_empty(), "still waiting is no news: {:?}", app.alerts);
+
+        let mut quiet = App::new(0, 1);
+        quiet.quiet = true;
+        let mut fresh = busy_snap();
+        quiet.set_snapshot(fresh.clone());
+        waiting(&mut fresh, "a1", "Bash: make");
+        quiet.set_snapshot(fresh);
+        assert!(quiet.alerts.is_empty());
     }
 
     /// A session row is `[account](directory) title`; no row shows the

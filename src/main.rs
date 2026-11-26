@@ -277,6 +277,10 @@ fn show(out: &mut Counted, office: &RgbaImage, cast: &mut Cast, d: &Display, app
             next = now + TICK.max(now.elapsed());
             full = false;
         }
+        if !app.alerts.is_empty() {
+            term.backend_mut().write_all(alert(&std::mem::take(&mut app.alerts), d).as_bytes())?;
+            term.backend_mut().flush()?;
+        }
         if !event::poll(next.saturating_duration_since(Instant::now()))? {
             continue;
         }
@@ -347,6 +351,19 @@ fn show(out: &mut Counted, office: &RgbaImage, cast: &mut Cast, d: &Display, app
 }
 
 /// One number for everything drawn on the picture.
+/// What tells you agents started waiting: the bell once (a sound, or a flash
+/// of the window or its taskbar button, as the terminal is set up), and a
+/// desktop notification each (OSC 9: iTerm2, WezTerm, kitty, Ghostty and
+/// others; the rest ignore it).
+fn alert(texts: &[String], d: &Display) -> String {
+    let mut out = String::from("\x07");
+    for t in texts {
+        let t: String = t.chars().filter(|c| !c.is_control()).take(160).collect();
+        out += &d.wrap(format!("\x1b]9;{t}\x1b\\"));
+    }
+    out
+}
+
 fn picture_key(items: &HashMap<String, Item>) -> u64 {
     let mut keys: Vec<(&String, u64)> = items.iter().map(|(id, it)| (id, it.key)).collect();
     keys.sort();
@@ -609,6 +626,7 @@ fn run(args: Args) -> Result<String, Box<dyn Error>> {
     let office = load_office(&args)?;
     let mut cast = load_cast(&args)?;
     let mut app = App::new(args.since, now() as u64);
+    app.quiet = args.quiet;
     // Only here, never for --dump or --snapshot; nothing is fetched until the Usage tab shows.
     app.limits = Some(limits::Limits::new(limits::accounts(&home()), args.offline));
     let (scans, rescan) = scanner(roots(&args), args.since);
@@ -720,6 +738,7 @@ mod tests {
             events: Vec::new(),
             children: Vec::new(),
             live: false,
+            held: Default::default(),
             continued: false,
         }
     }

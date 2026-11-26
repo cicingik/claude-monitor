@@ -20,6 +20,7 @@ const USAGE: &str = "usage: office [flags]
   --snapshot OUT.png  scan once, render the office at full size to OUT.png as it stands
                once a visitor has walked in (at most 30 s on), exit
   --offline    never fetch the accounts' 5 h and 7 day limits (tree, Usage tab)
+  --quiet      no bell or desktop notification when an agent starts waiting on you
   --protocol   how to draw (default auto: ask the terminal, else half blocks)
   --font       the terminal's cell size in pixels, for when the terminal does not answer;
                with --protocol, nothing is asked (halfblocks never asks, and assume 10x20)
@@ -52,6 +53,7 @@ pub(crate) struct Args {
     pub(crate) dump: bool,
     pub(crate) snapshot: Option<PathBuf>,
     pub(crate) offline: bool, // no requests for the accounts' limits
+    pub(crate) quiet: bool,   // no alerts when an agent starts waiting
 }
 
 pub(crate) fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -65,6 +67,7 @@ pub(crate) fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args, S
         dump: false,
         snapshot: None,
         offline: false,
+        quiet: false,
     };
     while let Some(a) = it.next() {
         let (name, inline) = match a.split_once('=') {
@@ -96,6 +99,7 @@ pub(crate) fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args, S
             "--dump" => args.dump = true,
             "--snapshot" => args.snapshot = Some(value()?.into()),
             "--offline" => args.offline = true,
+            "--quiet" => args.quiet = true,
             _ if name.starts_with('-') && name != "-" => return Err(format!("unknown flag {name}\n\n{USAGE}")),
             _ => return Err(format!("unexpected argument {a:?}\n\n{USAGE}")),
         }

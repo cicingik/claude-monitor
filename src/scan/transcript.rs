@@ -119,6 +119,7 @@ pub(super) fn build(st: &FileState, id: String, mtime: i64, now: i64, finished: 
         events: st.events.clone(),
         children: Vec::new(),
         live: false,
+        held: Default::default(),
         continued: st.continued,
     };
     for (mid, u) in &st.usage {

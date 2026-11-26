@@ -382,7 +382,9 @@ Press `v` to switch between the office and the tree.
 - **Header:** session, agent and running counts, last scan time, time window.
 - **Left pane:** a collapsible tree of sessions and their subagents, nested
   subagents included. Each row shows status, title, agent type, model, the
-  agent's own tokens and the age of its last activity.
+  agent's own tokens and the age of its last activity. A running session's
+  row also says how it runs: `bg` in the background, so `p` opens it in the
+  panel; `tty` in a terminal of its own, which `p` cannot open.
 - **Right pane, tab 1 Activity:** the selected agent's details and its last 50
   events, newest first. While it runs, `now:` shows the pending tool call.
 - **Tab 2 Interactions:** edges into and out of the selected agent, plus an
@@ -427,6 +429,12 @@ Status glyphs:
 | `◐`   | active  | file written < 30s ago                                            |
 | `○`   | idle    | otherwise                                                         |
 | `✓`   | done    | subagent meta says `finished: true`                               |
+
+When an agent turns `?`, office rings the terminal bell and sends a desktop
+notification naming it and what it waits on (OSC 9: iTerm2, WezTerm, kitty,
+Ghostty and others show it; other terminals ignore it, and Windows Terminal
+plays or flashes the bell as its `bellStyle` says). It alerts once per wait,
+and not for agents already waiting when office starts. `--quiet` turns it off.
 
 The transcript records no line when a permission prompt opens or is answered,
 so `?` is inferred: in a mode that asks, a command you already approved that

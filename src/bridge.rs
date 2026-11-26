@@ -270,46 +270,45 @@ pub fn overlay(snap: &mut crate::scan::Snapshot, root: &Path) {
 
 // Resuming a session that no process holds, in the background.
 
-/// The sessions running Claude Code processes of config_dir hold, by the
-/// id in their sessions/<pid>.json, background ones included.
-pub fn live_ids(config_dir: &Path) -> std::collections::HashSet<String> {
-    fs::read_dir(config_dir.join("sessions"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let v = serde_json::from_slice::<Value>(&fs::read(e.path()).ok()?).ok()?;
-            v.get("pid").and_then(Value::as_i64).filter(|p| alive_pid(*p))?;
-            Some(v.get("sessionId")?.as_str()?.to_string())
-        })
-        .collect()
-}
-
 /// Which Claude Code process holds a session.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Holder {
+    #[default]
     None,
     Background { job: String }, // `claude --bg`'s: `claude attach <job>` shows it
     Terminal,                   // a claude open in a terminal of its own
 }
 
-/// Who holds session (its id, as the scan names it) of config_dir, from
-/// the sessions/<pid>.json of running Claude Code processes.
-pub fn holder(config_dir: &Path, session: &str) -> Holder {
-    let raw = session.split('@').next().unwrap_or(session);
+/// The sessions running Claude Code processes of config_dir hold, by the id
+/// in their sessions/<pid>.json. Off unix no pid can be checked: unchecked
+/// keeps every registered one then, else none.
+fn registry(config_dir: &Path, unchecked: bool) -> std::collections::HashMap<String, Holder> {
+    let mut out = std::collections::HashMap::new();
     for e in fs::read_dir(config_dir.join("sessions")).into_iter().flatten().flatten() {
         let Ok(v) = serde_json::from_slice::<Value>(&fs::read(e.path()).unwrap_or_default()) else { continue };
         let s = |k: &str| v.get(k).and_then(Value::as_str);
-        // Off unix a pid is not checked: a stale file's attach says so itself.
-        if s("sessionId") != Some(raw) || !v.get("pid").and_then(Value::as_i64).is_some_and(|p| !cfg!(unix) || alive_pid(p)) {
+        let (Some(id), Some(pid)) = (s("sessionId"), v.get("pid").and_then(Value::as_i64)) else { continue };
+        if !(if cfg!(unix) { alive_pid(pid) } else { unchecked }) {
             continue;
         }
-        return match (s("kind"), s("jobId")) {
+        let held = match (s("kind"), s("jobId")) {
             (Some("bg"), Some(job)) => Holder::Background { job: job.into() },
             _ => Holder::Terminal,
         };
+        out.insert(id.to_string(), held);
     }
-    Holder::None
+    out
+}
+
+/// The sessions running Claude Code processes of config_dir hold, and how.
+pub fn live(config_dir: &Path) -> std::collections::HashMap<String, Holder> {
+    registry(config_dir, false)
+}
+
+/// Who holds session (its id, as the scan names it) of config_dir. Off unix
+/// a stale registry file counts: its attach says so itself.
+pub fn holder(config_dir: &Path, session: &str) -> Holder {
+    registry(config_dir, true).remove(session.split('@').next().unwrap_or(session)).unwrap_or(Holder::None)
 }
 
 /// `claude attach <job>` in session's folder under config_dir, for the panel's terminal.
@@ -583,10 +582,10 @@ mod tests {
         let me = process::id();
         fs::write(d.join("sessions").join(format!("{me}.json")), json!({ "pid": me, "sessionId": "s1" }).to_string()).unwrap();
         fs::write(d.join("sessions").join("1.json"), json!({ "pid": 999_999_999i64, "sessionId": "s2" }).to_string()).unwrap();
-        let held = live_ids(&d);
-        assert!(held.contains("s1"));
-        assert!(!held.contains("s2"), "its process is gone");
-        assert!(!held.contains("s3"), "never registered");
+        let held = live(&d);
+        assert_eq!(held.get("s1"), Some(&Holder::Terminal), "no kind: a terminal's");
+        assert!(!held.contains_key("s2"), "its process is gone");
+        assert!(!held.contains_key("s3"), "never registered");
         let _ = fs::remove_dir_all(&d);
     }
 
